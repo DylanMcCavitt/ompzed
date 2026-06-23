@@ -847,6 +847,127 @@ mod tests {
     use project::Project;
     use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 
+    /// Deterministic OMP agent-panel smoke harness.
+    ///
+    /// Against a throwaway workspace it proves the OMP agent can: start a
+    /// child, return to `Idle` after a harmless no-tool prompt, keep a
+    /// *denied* tool call/result visible (it must not disappear), and surface
+    /// the session (trace) file path OMP reports via `get_state`.
+    ///
+    /// Run on demand (deterministic; no network, no real/paid omp):
+    /// `cargo test -p agent_servers omp_smoke -- --nocapture`.
+    ///
+    /// Opt in to a real omp (HITL only — runs a *paid* turn, never in CI):
+    /// `OMP_BINARY=$(command -v omp) OMP_SMOKE_LIVE=1 cargo test -p agent_servers omp_smoke -- --nocapture`.
+    #[gpui::test]
+    async fn omp_smoke_agent_panel_harness(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+
+        // Stable agent identity — never couple this smoke to display copy
+        // (the user-facing label is owned by a separate issue).
+        assert_eq!(crate::omp::OMP_AGENT_ID, "omp");
+        assert_eq!(OmpAgentServer.agent_id(), AgentId::new("omp"));
+
+        // Default: deterministic FakeOmp. A real/paid omp is used only when the
+        // operator explicitly opts in with OMP_BINARY + OMP_SMOKE_LIVE=1.
+        let live = std::env::var_os("OMP_BINARY").is_some()
+            && std::env::var("OMP_SMOKE_LIVE").is_ok_and(|value| value == "1");
+        let fixture = (!live).then(|| FakeOmp::new("smoke"));
+        let command = match &fixture {
+            Some(fixture) => fixture.command(),
+            None => OmpCommand::default(),
+        };
+
+        let workspace = tempfile::tempdir().unwrap();
+        let connection = Rc::new(OmpAgentConnection::new(command));
+        let project = Project::example([workspace.path()], &mut cx.to_async()).await;
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[workspace.path()]), cx)
+            })
+            .await
+            .unwrap();
+
+        // Phase 0 — child started; record the session (trace) file path. OMP
+        // reports `sessionFile` via get_state; `apply_state_update` renders it
+        // into the thread title (`{sessionName} · {sessionFile}`) and the
+        // `omp_session_file` session meta.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let title = loop {
+            if let Some(title) = thread.read_with(cx, |thread, _| {
+                thread.title().map(|title| title.to_string())
+            }) {
+                break title;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "OMP should report session state (with a session file) via get_state"
+            );
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+            cx.run_until_parked();
+        };
+        let session_file = title.rsplit(" · ").next().unwrap_or_default();
+        assert!(
+            !session_file.is_empty(),
+            "OMP smoke must record a non-empty session (trace) file path"
+        );
+        eprintln!("omp_smoke session file: {session_file}");
+        if fixture.is_some() {
+            assert!(session_file.ends_with(".jsonl"));
+        }
+
+        // Phase 1 — harmless no-tool prompt streams text and returns to idle.
+        thread
+            .update(cx, |thread, cx| thread.send_raw("hello", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert!(
+                thread
+                    .entries()
+                    .iter()
+                    .any(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_))),
+                "no-tool prompt should produce assistant text"
+            );
+            if fixture.is_some() {
+                assert!(thread.to_markdown(cx).contains("Hello from fake OMP smoke"));
+            }
+        });
+
+        // Phase 2 — a denied tool call must stay visible (the tool call and its
+        // failed result do not disappear) and the turn still returns to idle.
+        thread
+            .update(cx, |thread, cx| thread.send_raw("fan out", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            let markdown = thread.to_markdown(cx);
+            if fixture.is_some() {
+                assert!(
+                    markdown.contains("Tool call denied by user: task"),
+                    "denied tool result text must remain visible"
+                );
+                let tool_call = thread
+                    .entries()
+                    .iter()
+                    .find_map(|entry| match entry {
+                        AgentThreadEntry::ToolCall(call) => Some(call),
+                        _ => None,
+                    })
+                    .expect("denied OMP tool result should create a tool call entry");
+                assert!(matches!(tool_call.status, ToolCallStatus::Failed));
+            }
+        });
+    }
+
     #[gpui::test]
     async fn omp_no_tool_prompt_streams_text_and_ends_idle(cx: &mut TestAppContext) {
         crate::e2e_tests::init_test(cx).await;
@@ -1111,6 +1232,24 @@ mod tests {
                                   printf '{{"type":"message_end","message":{{"role":"toolResult","id":"tool-1","toolName":"task","isError":true,"content":[{{"type":"text","text":"Tool call denied by user: task"}}]}}}}\n'
                                   printf '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","delta":"Denied again"}}}}\n'
                                   printf '{{"type":"turn_end","message":{{"stopReason":"endTurn"}}}}\n'
+                                  ;;
+                                smoke)
+                                  count_file="{pid_path}.count"
+                                  count=$(cat "$count_file" 2>/dev/null || printf '0')
+                                  count=$((count + 1))
+                                  printf '%s' "$count" > "$count_file"
+                                  if [ "$count" = "1" ]; then
+                                    printf '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","delta":"Hello "}}}}\n'
+                                    printf '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","delta":"from fake OMP smoke"}}}}\n'
+                                    printf '{{"type":"agent_end"}}\n'
+                                  else
+                                    printf '{{"type":"message_update","assistantMessageEvent":{{"type":"toolcall_end","toolCall":{{"id":"tool-1","name":"task","arguments":{{"_i":"fan out"}}}}}}}}\n'
+                                    printf '{{"type":"turn_end","message":{{"stopReason":"toolUse"}}}}\n'
+                                    sleep 1
+                                    printf '{{"type":"message_end","message":{{"role":"toolResult","id":"tool-1","toolName":"task","isError":true,"content":[{{"type":"text","text":"Tool call denied by user: task"}}]}}}}\n'
+                                    printf '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","delta":"Denied again"}}}}\n'
+                                    printf '{{"type":"turn_end","message":{{"stopReason":"endTurn"}}}}\n'
+                                  fi
                                   ;;
                                 wait)
                                   ;;
