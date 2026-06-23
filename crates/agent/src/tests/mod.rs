@@ -57,6 +57,23 @@ use util::path;
 mod test_tools;
 use test_tools::*;
 
+// Skips a live-model e2e test (counts as a clean pass) when no model
+// credentials are available. Mirrors the skip guards in
+// `agent_servers::e2e_tests`, reusing the same `ANTHROPIC_API_KEY` signal so the
+// live `TestModel::Sonnet4` lanes do not panic without paid credentials.
+macro_rules! skip_e2e_without_credentials {
+    ($name:literal) => {
+        if !agent_servers::e2e_tests::e2e_credentials_available() {
+            eprintln!(
+                "skipping {}: no model credentials; set {} (or sign in) to run live agent e2e tests",
+                $name,
+                agent_servers::e2e_tests::E2E_CREDENTIALS_ENV_VAR,
+            );
+            return;
+        }
+    };
+}
+
 pub(crate) fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
@@ -754,6 +771,7 @@ async fn test_prompt_caching(cx: &mut TestAppContext) {
 #[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_basic_tool_calls(cx: &mut TestAppContext) {
+    skip_e2e_without_credentials!("test_basic_tool_calls");
     let ThreadTest { thread, .. } = setup(cx, TestModel::Sonnet4).await;
 
     // Test a tool call that's likely to complete *before* streaming stops.
@@ -814,6 +832,7 @@ async fn test_basic_tool_calls(cx: &mut TestAppContext) {
 #[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_streaming_tool_calls(cx: &mut TestAppContext) {
+    skip_e2e_without_credentials!("test_streaming_tool_calls");
     let ThreadTest { thread, .. } = setup(cx, TestModel::Sonnet4).await;
 
     // Test a tool call that's likely to complete *before* streaming stops.
@@ -1338,6 +1357,7 @@ fn test_permission_options_terminal_pipeline_with_chaining() {
 #[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_concurrent_tool_calls(cx: &mut TestAppContext) {
+    skip_e2e_without_credentials!("test_concurrent_tool_calls");
     let ThreadTest { thread, .. } = setup(cx, TestModel::Sonnet4).await;
 
     // Test concurrent tool calls with different delay times
@@ -2141,6 +2161,7 @@ async fn test_mcp_tool_truncation(cx: &mut TestAppContext) {
 #[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_cancellation(cx: &mut TestAppContext) {
+    skip_e2e_without_credentials!("test_cancellation");
     let ThreadTest { thread, .. } = setup(cx, TestModel::Sonnet4).await;
 
     let mut events = thread
@@ -4506,13 +4527,19 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
                 let model = models
                     .available_models(cx)
                     .find(|model| model.id() == model_id)
-                    .unwrap();
+                    .expect(
+                        "claude-sonnet-4-latest not available; set ANTHROPIC_API_KEY to run live agent e2e tests",
+                    );
 
-                let provider = models.provider(&model.provider_id()).unwrap();
+                let provider = models
+                    .provider(&model.provider_id())
+                    .expect("Anthropic provider should be registered for live agent e2e tests");
                 let authenticated = provider.authenticate(cx);
 
                 cx.spawn(async move |_cx| {
-                    authenticated.await.unwrap();
+                    authenticated.await.expect(
+                        "Anthropic authentication failed; verify ANTHROPIC_API_KEY is valid for live agent e2e tests",
+                    );
                     model
                 })
             }

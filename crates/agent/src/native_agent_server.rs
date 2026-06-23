@@ -68,16 +68,28 @@ mod tests {
         async |fs, cx| {
             let auth = cx.update(|cx| {
                 prompt_store::init(cx);
+
+                // Register the language-model providers (Anthropic et al.) into
+                // the registry the same way the `TestModel::Sonnet4` setup does
+                // in `crate::tests`; `init_test` only initializes the registry,
+                // it never registers providers, so without this the Anthropic
+                // provider is always absent and the live path is unreachable.
+                let client = client::Client::production(cx);
+                let user_store = cx.new(|cx| client::UserStore::new(client.clone(), cx));
+                language_models::init(user_store, client, cx);
+
                 let registry = language_model::LanguageModelRegistry::read_global(cx);
                 let auth = registry
                     .provider(&language_model::ANTHROPIC_PROVIDER_ID)
-                    .unwrap()
+                    .expect("Anthropic provider should be registered for agent e2e tests")
                     .authenticate(cx);
 
                 cx.spawn(async move |_| auth.await)
             });
 
-            auth.await.unwrap();
+            auth.await.expect(
+                "Anthropic authentication failed; verify ANTHROPIC_API_KEY is valid for agent e2e tests",
+            );
 
             cx.update(|cx| {
                 let registry = language_model::LanguageModelRegistry::global(cx);
