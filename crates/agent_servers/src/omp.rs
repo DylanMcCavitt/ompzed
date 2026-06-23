@@ -1,5 +1,5 @@
 use crate::{AgentServer, AgentServerDelegate};
-use acp_thread::{AcpThread, AgentConnection, UserMessageId};
+use acp_thread::{AcpThread, AgentConnection, UserMessageId, meta_with_tool_name};
 use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result, anyhow};
@@ -417,9 +417,11 @@ impl OmpSessionState {
         match frame.get("type").and_then(Value::as_str) {
             Some("response") => self.resolve_response(frame),
             Some("message_update") => self.handle_message_update(&frame, cx),
-            Some("agent_end") | Some("turn_end") => {
-                self.complete_prompt(acp::StopReason::EndTurn);
-            }
+            Some("message_end") => self.handle_message_end(&frame, cx),
+            Some("tool_execution_start") => self.handle_tool_execution_start(&frame, cx),
+            Some("tool_execution_end") => self.handle_tool_execution_end(&frame, cx),
+            Some("agent_end") => self.complete_prompt(acp::StopReason::EndTurn),
+            Some("turn_end") => self.handle_turn_end(&frame),
             Some("extension_ui_request") => self.handle_ui_request(&frame),
             _ => {}
         }
@@ -454,28 +456,192 @@ impl OmpSessionState {
     }
 
     fn handle_message_update(&self, frame: &Value, cx: &mut AsyncApp) {
-        let Some(delta) = frame
-            .get("assistantMessageEvent")
-            .and_then(|event| {
-                (event.get("type").and_then(Value::as_str) == Some("text_delta"))
-                    .then(|| event.get("delta").and_then(Value::as_str))
-                    .flatten()
-            })
-            .filter(|delta| !delta.is_empty())
+        let Some(event) = frame.get("assistantMessageEvent") else {
+            return;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("text_delta") => {
+                if let Some(delta) = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .filter(|delta| !delta.is_empty())
+                {
+                    self.send_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            delta.to_owned().into(),
+                        )),
+                        cx,
+                    );
+                }
+            }
+            Some("thinking_delta") => {
+                if let Some(delta) = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .filter(|delta| !delta.is_empty())
+                {
+                    self.send_session_update(
+                        acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+                            delta.to_owned().into(),
+                        )),
+                        cx,
+                    );
+                }
+            }
+            Some("toolcall_end") => {
+                if let Some(tool_call) = event.get("toolCall") {
+                    self.send_tool_call(
+                        tool_call,
+                        acp::ToolCallStatus::Pending,
+                        Vec::new(),
+                        None,
+                        cx,
+                    );
+                }
+            }
+            Some("error") => {
+                if let Some(message) = event
+                    .get("error")
+                    .and_then(|error| error.get("errorMessage").or_else(|| error.get("message")))
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.is_empty())
+                {
+                    self.send_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            message.to_owned().into(),
+                        )),
+                        cx,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_message_end(&self, frame: &Value, cx: &mut AsyncApp) {
+        let Some(message) = frame.get("message") else {
+            return;
+        };
+        match message.get("role").and_then(Value::as_str) {
+            Some("toolResult") => {
+                let status = if message.get("isError").and_then(Value::as_bool) == Some(true) {
+                    acp::ToolCallStatus::Failed
+                } else {
+                    acp::ToolCallStatus::Completed
+                };
+                self.send_tool_result(message, status, cx);
+            }
+            Some("assistant") => {
+                if let Some(error) = message
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .filter(|error| !error.is_empty())
+                {
+                    self.send_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            error.to_owned().into(),
+                        )),
+                        cx,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_tool_execution_start(&self, frame: &Value, cx: &mut AsyncApp) {
+        self.send_tool_call(frame, acp::ToolCallStatus::InProgress, Vec::new(), None, cx);
+    }
+
+    fn handle_tool_execution_end(&self, frame: &Value, cx: &mut AsyncApp) {
+        let status = if frame.get("isError").and_then(Value::as_bool) == Some(true) {
+            acp::ToolCallStatus::Failed
+        } else {
+            acp::ToolCallStatus::Completed
+        };
+        self.send_tool_result(frame, status, cx);
+    }
+
+    fn send_tool_result(&self, frame: &Value, status: acp::ToolCallStatus, cx: &mut AsyncApp) {
+        let content = tool_result_content(frame);
+        let raw_output = Some(
+            frame
+                .get("result")
+                .cloned()
+                .unwrap_or_else(|| frame.clone()),
+        );
+        self.send_tool_call(frame, status, content, raw_output, cx);
+    }
+
+    fn send_tool_call(
+        &self,
+        frame: &Value,
+        status: acp::ToolCallStatus,
+        content: Vec<acp::ToolCallContent>,
+        raw_output: Option<Value>,
+        cx: &mut AsyncApp,
+    ) {
+        let Some(id) = frame
+            .get("id")
+            .or_else(|| frame.get("toolCallId"))
+            .and_then(Value::as_str)
         else {
             return;
         };
+        let Some(name) = frame
+            .get("name")
+            .or_else(|| frame.get("toolName"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        let arguments = frame
+            .get("arguments")
+            .or_else(|| frame.get("args"))
+            .cloned();
+        let title = tool_title(
+            name,
+            arguments.as_ref().unwrap_or(&Value::Null),
+            frame.get("intent").and_then(Value::as_str),
+        );
+        let mut call = acp::ToolCall::new(id.to_owned(), title)
+            .kind(tool_kind(name))
+            .status(status)
+            .meta(meta_with_tool_name(name));
+        if let Some(arguments) = arguments {
+            call = call.raw_input(arguments);
+        }
+        if !content.is_empty() {
+            call = call.content(content);
+        }
+        if let Some(raw_output) = raw_output {
+            call = call.raw_output(raw_output);
+        }
+        self.send_session_update(acp::SessionUpdate::ToolCall(call), cx);
+    }
+
+    fn send_session_update(&self, update: acp::SessionUpdate, cx: &mut AsyncApp) {
         if let Some(thread) = self
             .thread
             .borrow()
             .as_ref()
             .and_then(|thread| thread.upgrade())
         {
-            let update =
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(delta.into()));
             thread
                 .update(cx, |thread, cx| thread.handle_session_update(update, cx))
                 .log_err();
+        }
+    }
+
+    fn handle_turn_end(&self, frame: &Value) {
+        match frame
+            .get("message")
+            .and_then(|message| message.get("stopReason"))
+            .and_then(Value::as_str)
+        {
+            Some("toolUse") => {}
+            Some("aborted") => self.complete_prompt(acp::StopReason::Cancelled),
+            _ => self.complete_prompt(acp::StopReason::EndTurn),
         }
     }
 
@@ -514,6 +680,10 @@ impl OmpSessionState {
             .get("sessionFile")
             .and_then(Value::as_str)
             .filter(|path| !path.is_empty());
+        let session_id = state
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
         let Some(title) = session_file
             .map(|file| match session_name {
                 Some(name) => format!("{name} · {file}"),
@@ -529,8 +699,12 @@ impl OmpSessionState {
             .as_ref()
             .and_then(|thread| thread.upgrade())
         {
-            let update =
-                acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().title(title));
+            let mut info = acp::SessionInfoUpdate::new().title(title);
+            let meta = omp_session_meta(session_id, session_file);
+            if !meta.is_empty() {
+                info = info.meta(meta);
+            }
+            let update = acp::SessionUpdate::SessionInfoUpdate(info);
             thread
                 .update(cx, |thread, cx| thread.handle_session_update(update, cx))
                 .log_err();
@@ -597,6 +771,65 @@ fn prompt_text(prompt: &[acp::ContentBlock]) -> String {
         .collect()
 }
 
+fn tool_title(name: &str, arguments: &Value, intent: Option<&str>) -> String {
+    let intent = intent
+        .filter(|intent| !intent.is_empty())
+        .or_else(|| arguments.get("_i").and_then(Value::as_str))
+        .filter(|intent| !intent.is_empty());
+    match intent {
+        Some(intent) => format!("{name}: {intent}"),
+        None => name.to_owned(),
+    }
+}
+
+fn tool_kind(name: &str) -> acp::ToolKind {
+    match name {
+        "read" => acp::ToolKind::Read,
+        "edit" | "write" | "ast_edit" => acp::ToolKind::Edit,
+        "find" | "search" | "ast_grep" | "web_search" => acp::ToolKind::Search,
+        "bash" | "debug" | "eval" | "job" | "task" => acp::ToolKind::Execute,
+        _ => acp::ToolKind::Other,
+    }
+}
+
+fn tool_result_content(frame: &Value) -> Vec<acp::ToolCallContent> {
+    let Some(blocks) = frame
+        .get("content")
+        .or_else(|| frame.get("result").and_then(|result| result.get("content")))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut text = String::new();
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(block_text) = block.get("text").and_then(Value::as_str)
+            && !block_text.is_empty()
+        {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(block_text);
+        }
+    }
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![acp::ToolCallContent::Content(acp::Content::new(text))]
+    }
+}
+
+fn omp_session_meta(session_id: Option<&str>, session_file: Option<&str>) -> acp::Meta {
+    let mut meta = acp::Meta::new();
+    if let Some(session_id) = session_id {
+        meta.insert("omp_session_id".to_owned(), session_id.into());
+    }
+    if let Some(session_file) = session_file {
+        meta.insert("omp_session_file".to_owned(), session_file.into());
+    }
+    meta
+}
+
 fn response_error(frame: &Value) -> String {
     frame
         .get("error")
@@ -608,7 +841,7 @@ fn response_error(frame: &Value) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use acp_thread::{AgentThreadEntry, ThreadStatus};
+    use acp_thread::{AgentThreadEntry, ThreadStatus, ToolCallStatus};
     use gpui::TestAppContext;
     use indoc::formatdoc;
     use project::Project;
@@ -693,6 +926,45 @@ mod tests {
         assert!(seen_response.contains("\"confirmed\":false"));
         thread.read_with(cx, |thread, _| {
             assert_eq!(thread.status(), ThreadStatus::Idle)
+        });
+    }
+
+    #[gpui::test]
+    async fn omp_tool_denial_waits_for_final_turn_and_surfaces_tool_result(
+        cx: &mut TestAppContext,
+    ) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmp::new("tool");
+        let connection = Rc::new(OmpAgentConnection::new(fixture.command()));
+        let project = Project::example([fixture.dir.path()], &mut cx.to_async()).await;
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[fixture.dir.path()]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("fan out", cx))
+            .await
+            .unwrap();
+
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            let markdown = thread.to_markdown(cx);
+            assert!(markdown.contains("Denied again"));
+            assert!(markdown.contains("Tool call denied by user: task"));
+            let tool_call = thread
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+                .expect("denied OMP tool result should create a tool call entry");
+            assert!(matches!(tool_call.status, ToolCallStatus::Failed));
         });
     }
 
@@ -831,6 +1103,14 @@ mod tests {
                                   ;;
                                 ui)
                                   printf '{{"type":"extension_ui_request","id":"ui-1","method":"confirm","message":"Allow?"}}\n'
+                                  ;;
+                                tool)
+                                  printf '{{"type":"message_update","assistantMessageEvent":{{"type":"toolcall_end","toolCall":{{"id":"tool-1","name":"task","arguments":{{"_i":"fan out"}}}}}}}}\n'
+                                  printf '{{"type":"turn_end","message":{{"stopReason":"toolUse"}}}}\n'
+                                  sleep 1
+                                  printf '{{"type":"message_end","message":{{"role":"toolResult","id":"tool-1","toolName":"task","isError":true,"content":[{{"type":"text","text":"Tool call denied by user: task"}}]}}}}\n'
+                                  printf '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","delta":"Denied again"}}}}\n'
+                                  printf '{{"type":"turn_end","message":{{"stopReason":"endTurn"}}}}\n'
                                   ;;
                                 wait)
                                   ;;

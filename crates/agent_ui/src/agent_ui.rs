@@ -154,7 +154,7 @@ pub(crate) fn open_abs_path_at_point(
     true
 }
 
-pub const DEFAULT_THREAD_TITLE: &str = "New Agent Thread";
+pub const DEFAULT_THREAD_TITLE: &str = "New Ompzed Thread";
 const PARALLEL_AGENT_LAYOUT_BACKFILL_KEY: &str = "parallel_agent_layout_backfilled";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -435,9 +435,9 @@ pub struct NewNativeAgentThreadFromSummary {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Agent {
-    #[default]
     #[serde(alias = "NativeAgent", alias = "TextThread")]
     NativeAgent,
+    #[default]
     Omp,
     #[serde(alias = "Custom")]
     Custom {
@@ -481,8 +481,8 @@ impl Agent {
 
     pub fn label(&self) -> SharedString {
         match self {
-            Self::NativeAgent => "Zed Agent".into(),
-            Self::Omp => "OMP Agent".into(),
+            Self::NativeAgent => "Built-in Agent".into(),
+            Self::Omp => "Ompzed Agent".into(),
             Self::Custom { id, .. } => id.0.clone(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => "Stub Agent".into(),

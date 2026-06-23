@@ -574,7 +574,7 @@ impl Render for AgentRegistryPage {
                             .w_full()
                             .gap_1p5()
                             .justify_between()
-                            .child(Headline::new("ACP Registry").size(HeadlineSize::Large))
+                            .child(Headline::new("Ompzed Agent Registry").size(HeadlineSize::Large))
                             .child(
                                 Button::new("learn-more", "Learn More")
                                     .style(ButtonStyle::Outlined)
@@ -671,7 +671,7 @@ impl Item for AgentRegistryPage {
     type Event = ItemEvent;
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "ACP Registry".into()
+        "Ompzed Agent Registry".into()
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {

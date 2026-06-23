@@ -1580,7 +1580,11 @@ impl AgentPanel {
             pending_serialization: None,
             new_user_onboarding: onboarding,
             thread_store,
-            selected_agent: Agent::default(),
+            selected_agent: if project.read(cx).is_via_collab() {
+                Agent::NativeAgent
+            } else {
+                Agent::default()
+            },
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
             new_user_onboarding_upsell_dismissed: AtomicBool::new(OnboardingUpsell::dismissed(cx)),
@@ -4774,7 +4778,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                     .is_some_and(|id| id != agent::ZED_AGENT_ID.as_ref())
             {
                 return Err(anyhow!(
-                    "Only the Zed Agent is available in shared projects. Call \
+                    "Only the built-in agent is available in shared projects. Call \
                      `list_agents_and_models` to see the agents available for `create_thread`."
                 ));
             }
@@ -5108,7 +5112,7 @@ impl Panel for AgentPanel {
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Agent Panel")
+        Some("Ompzed Agent Panel")
     }
 
     fn toggle_action(&self) -> Box<dyn Action> {
@@ -5532,7 +5536,7 @@ impl AgentPanel {
             VisibleSurface::Configuration(_) => {
                 Label::new("Settings").truncate().into_any_element()
             }
-            VisibleSurface::Uninitialized => Label::new("Agent").truncate().into_any_element(),
+            VisibleSurface::Uninitialized => Label::new("Ompzed").truncate().into_any_element(),
         };
 
         let toolbar_bg = cx.theme().colors().tab_bar_background;
@@ -5649,6 +5653,7 @@ impl AgentPanel {
         let supports_logout = self
             .active_conversation_view()
             .is_some_and(|conversation_view| conversation_view.read(cx).supports_logout());
+        let has_active_thread = self.active_thread_id(cx).is_some();
 
         let project_agents_md_path = project_agents_md_path(&self.project, true, cx);
 
@@ -5774,6 +5779,17 @@ impl AgentPanel {
                             menu = menu.action("Profiles", Box::new(ManageProfiles::default()));
                         }
 
+                        if has_active_thread {
+                            menu = menu
+                                .header("Session Trace")
+                                .action(
+                                    "Open Thread Transcript",
+                                    Box::new(OpenActiveThreadAsMarkdown),
+                                )
+                                .action("Show Thread Metadata", Box::new(ShowThreadMetadata))
+                                .separator();
+                        }
+
                         menu = menu
                             .action("Settings", Box::new(OpenSettings))
                             .separator()
@@ -5814,7 +5830,7 @@ impl AgentPanel {
         let focus_handle = self.focus_handle(cx);
 
         ProjectEmptyState::new(
-            "Agent Panel",
+            "Ompzed Agent Panel",
             focus_handle.clone(),
             KeyBinding::for_action_in(&workspace::Open::default(), &focus_handle, cx),
         )
@@ -5901,7 +5917,7 @@ impl AgentPanel {
                             }
                         })
                         .item(
-                            ContextMenuEntry::new("Zed Agent")
+                            ContextMenuEntry::new("Built-in Agent")
                                 .when(
                                     !showing_terminal && is_agent_selected(Agent::NativeAgent),
                                     |this| this.action(Box::new(NewThread)),
@@ -5932,7 +5948,7 @@ impl AgentPanel {
                                 }),
                         )
                         .item(
-                            ContextMenuEntry::new("OMP Agent")
+                            ContextMenuEntry::new("Ompzed Agent")
                                 .when(!showing_terminal && is_agent_selected(Agent::Omp), |this| {
                                     this.action(Box::new(NewThread))
                                 })
@@ -6115,6 +6131,13 @@ impl AgentPanel {
         let selected_agent = div()
             .id("selected_agent_icon")
             .px_0p5()
+            .when(can_create_entries, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_new_thread_menu(&ToggleNewThreadMenu, window, cx);
+                    }))
+            })
             .when_some(selected_agent_custom_icon, |this, icon_path| {
                 this.child(
                     Icon::from_external_svg(icon_path)
@@ -6131,7 +6154,7 @@ impl AgentPanel {
                 Tooltip::with_meta(
                     selected_agent_label_for_tooltip.clone(),
                     None,
-                    "Selected Agent",
+                    "Click to switch agents",
                     cx,
                 )
             });
@@ -11714,21 +11737,21 @@ mod tests {
             panel
         });
 
-        // Create a draft with the default NativeAgent.
+        // Create a draft with the default Ompzed agent.
         panel.update_in(cx, |panel, window, cx| {
             panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
         });
 
         let first_draft_id = panel.read_with(cx, |panel, cx| {
             assert!(panel.draft_thread.is_some());
-            assert_eq!(panel.selected_agent, Agent::NativeAgent);
+            assert_eq!(panel.selected_agent, Agent::Omp);
             let draft = panel.draft_thread.as_ref().unwrap();
-            assert_eq!(*draft.read(cx).agent_key(), Agent::NativeAgent);
+            assert_eq!(*draft.read(cx).agent_key(), Agent::Omp);
             draft.entity_id()
         });
 
         // Switch selected_agent to a custom agent, then activate_draft again.
-        // The stale NativeAgent draft should be replaced.
+        // The stale Ompzed draft should be replaced.
         let custom_agent = Agent::Custom {
             id: "my-custom-agent".into(),
         };
@@ -13336,7 +13359,7 @@ mod tests {
             let draft = panel.draft_thread.as_ref().expect("draft should exist");
             assert_eq!(
                 *draft.read(cx).agent_key(),
-                Agent::NativeAgent,
+                Agent::Omp,
                 "destination draft should start on the default agent"
             );
             draft.entity_id()
