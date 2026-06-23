@@ -4765,9 +4765,24 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
         let panel = self.panel.clone();
         let window = self.window;
         cx.spawn(async move |cx| {
+            let is_via_collab =
+                panel.read_with(cx, |panel, cx| panel.project.read(cx).is_via_collab())?;
+            if is_via_collab
+                && request
+                    .agent_id
+                    .as_deref()
+                    .is_some_and(|id| id != agent::ZED_AGENT_ID.as_ref())
+            {
+                return Err(anyhow!(
+                    "Only the Zed Agent is available in shared projects. Call \
+                     `list_agents_and_models` to see the agents available for `create_thread`."
+                ));
+            }
+
             let agent_choice = match request.agent_id.as_deref() {
                 None => None,
                 Some(id) if id == agent::ZED_AGENT_ID.as_ref() => Some(Agent::NativeAgent),
+                Some(id) if id == agent_servers::OMP_AGENT_ID => Some(Agent::Omp),
                 Some(id) => {
                     // Reject unknown agent ids up front so the model gets a
                     // structured error pointing at `list_agents_and_models`,
@@ -4892,9 +4907,13 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                         window,
                         cx,
                     );
-                    let resolved_agent = agent_choice
-                        .clone()
-                        .unwrap_or_else(|| panel.selected_agent.clone());
+                    let resolved_agent = if is_via_collab {
+                        Agent::NativeAgent
+                    } else {
+                        agent_choice
+                            .clone()
+                            .unwrap_or_else(|| panel.selected_agent.clone())
+                    };
                     resolved_agent.id()
                 })
             })??;
@@ -4948,22 +4967,30 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
             is_native: true,
             models: native_models,
         });
-
         let project = panel.read(cx).project.clone();
-        let agent_server_store = project.read(cx).agent_server_store().clone();
-        let store = agent_server_store.read(cx);
-        for agent_id in store.external_agents() {
-            let display = store
-                .agent_display_name(agent_id)
-                .unwrap_or_else(|| agent_id.0.clone());
+        if !project.read(cx).is_via_collab() {
             agents.push(agent::AvailableAgent {
-                id: agent_id.0.to_string(),
-                name: display,
+                id: agent_servers::OMP_AGENT_ID.to_string(),
+                name: Agent::Omp.label(),
                 is_native: false,
-                // External agents pick their own models dynamically; we don't
-                // try to enumerate them ahead of time.
                 models: Vec::new(),
             });
+
+            let agent_server_store = project.read(cx).agent_server_store().clone();
+            let store = agent_server_store.read(cx);
+            for agent_id in store.external_agents() {
+                let display = store
+                    .agent_display_name(agent_id)
+                    .unwrap_or_else(|| agent_id.0.clone());
+                agents.push(agent::AvailableAgent {
+                    id: agent_id.0.to_string(),
+                    name: display,
+                    is_native: false,
+                    // External agents pick their own models dynamically; we don't
+                    // try to enumerate them ahead of time.
+                    models: Vec::new(),
+                });
+            }
         }
 
         Ok(agent::AvailableAgents { agents })
@@ -5891,6 +5918,37 @@ impl AgentPanel {
                                                 {
                                                     panel.update(cx, |panel, cx| {
                                                         panel.selected_agent = Agent::NativeAgent;
+                                                        panel.activate_new_thread(
+                                                            true,
+                                                            AgentThreadSource::AgentPanel,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                            });
+                                        }
+                                    }
+                                }),
+                        )
+                        .item(
+                            ContextMenuEntry::new("OMP Agent")
+                                .when(!showing_terminal && is_agent_selected(Agent::Omp), |this| {
+                                    this.action(Box::new(NewThread))
+                                })
+                                .icon(IconName::Sparkle)
+                                .icon_color(Color::Muted)
+                                .disabled(is_via_collab)
+                                .handler({
+                                    let workspace = workspace.clone();
+                                    move |window, cx| {
+                                        if let Some(workspace) = workspace.upgrade() {
+                                            workspace.update(cx, |workspace, cx| {
+                                                if let Some(panel) =
+                                                    workspace.panel::<AgentPanel>(cx)
+                                                {
+                                                    panel.update(cx, |panel, cx| {
+                                                        panel.selected_agent = Agent::Omp;
                                                         panel.activate_new_thread(
                                                             true,
                                                             AgentThreadSource::AgentPanel,

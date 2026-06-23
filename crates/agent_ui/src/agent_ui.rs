@@ -418,6 +418,7 @@ where
         AgentIdOrLegacyAgent::AgentId(agent_id) => Ok(agent_id),
         AgentIdOrLegacyAgent::LegacyAgent(Agent::Custom { id }) => Ok(id),
         AgentIdOrLegacyAgent::LegacyAgent(Agent::NativeAgent) => Ok(Agent::NativeAgent.id()),
+        AgentIdOrLegacyAgent::LegacyAgent(Agent::Omp) => Ok(Agent::Omp.id()),
         #[cfg(any(test, feature = "test-support"))]
         AgentIdOrLegacyAgent::LegacyAgent(Agent::Stub) => Ok(Agent::Stub.id()),
     }
@@ -437,6 +438,7 @@ pub enum Agent {
     #[default]
     #[serde(alias = "NativeAgent", alias = "TextThread")]
     NativeAgent,
+    Omp,
     #[serde(alias = "Custom")]
     Custom {
         #[serde(rename = "name")]
@@ -451,6 +453,9 @@ impl From<AgentId> for Agent {
         if id.as_ref() == agent::ZED_AGENT_ID.as_ref() {
             return Self::NativeAgent;
         }
+        if id.as_ref() == agent_servers::OMP_AGENT_ID {
+            return Self::Omp;
+        }
         #[cfg(any(test, feature = "test-support"))]
         if id.as_ref() == "stub" {
             return Self::Stub;
@@ -463,6 +468,7 @@ impl Agent {
     pub fn id(&self) -> AgentId {
         match self {
             Self::NativeAgent => agent::ZED_AGENT_ID.clone(),
+            Self::Omp => agent_servers::OMP_AGENT_ID.into(),
             Self::Custom { id } => id.clone(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => "stub".into(),
@@ -476,6 +482,7 @@ impl Agent {
     pub fn label(&self) -> SharedString {
         match self {
             Self::NativeAgent => "Zed Agent".into(),
+            Self::Omp => "OMP Agent".into(),
             Self::Custom { id, .. } => id.0.clone(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => "Stub Agent".into(),
@@ -485,6 +492,7 @@ impl Agent {
     pub fn icon(&self) -> Option<IconName> {
         match self {
             Self::NativeAgent => None,
+            Self::Omp => Some(IconName::Sparkle),
             Self::Custom { .. } => Some(IconName::Sparkle),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => None,
@@ -498,6 +506,7 @@ impl Agent {
     ) -> Rc<dyn agent_servers::AgentServer> {
         match self {
             Self::NativeAgent => Rc::new(agent::NativeAgentServer::new(fs, thread_store)),
+            Self::Omp => Rc::new(agent_servers::OmpAgentServer),
             Self::Custom { id: name } => {
                 Rc::new(agent_servers::CustomAgentServer::new(name.clone()))
             }
@@ -1235,6 +1244,10 @@ mod tests {
             Agent::NativeAgent,
         );
         assert_eq!(
+            serde_json::from_str::<Agent>(r#""omp""#).unwrap(),
+            Agent::Omp,
+        );
+        assert_eq!(
             serde_json::from_str::<Agent>(r#"{"Custom":{"name":"my-agent"}}"#).unwrap(),
             Agent::Custom {
                 id: "my-agent".into(),
@@ -1257,6 +1270,9 @@ mod tests {
         let action = serde_json::from_str::<NewExternalAgentThread>(r#"{"agent":"NativeAgent"}"#)
             .expect("should deserialize legacy native agent payload");
         assert_eq!(action.agent, Agent::NativeAgent.id());
+        let action = serde_json::from_str::<NewExternalAgentThread>(r#"{"agent":"omp"}"#)
+            .expect("should deserialize built-in OMP agent id");
+        assert_eq!(action.agent, Agent::Omp.id());
 
         assert!(serde_json::from_str::<NewExternalAgentThread>(r#"{}"#).is_err());
     }
