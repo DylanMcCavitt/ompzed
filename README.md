@@ -1,9 +1,13 @@
-# Zed
+# Ompzed
+
+Ompzed is the OMP coding platform — a downstream fork of [Zed](https://github.com/zed-industries/zed) that layers OMP's agent workflow onto the editor. It tracks upstream Zed and is rebranded so it runs alongside an installed Zed without colliding with its user data.
+
+### Built on Zed
+
+Ompzed is built on [Zed](https://github.com/zed-industries/zed), a high-performance, multiplayer code editor from [Zed Industries, Inc.](https://zed.dev), created by the makers of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter). All upstream Zed copyright, attribution, and licensing are preserved (see [Licensing](#licensing) below). Ompzed is an independent fork and is not affiliated with or endorsed by Zed Industries, Inc.
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
-
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
 ---
 
