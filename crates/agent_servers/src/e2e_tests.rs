@@ -1,3 +1,23 @@
+//! End-to-end tests that exercise an [`AgentServer`] against a real language
+//! model.
+//!
+//! These lanes are compiled behind the consuming crate's `e2e` feature (the
+//! generated tests are `#[ignore]`d otherwise) and only attempt the live model
+//! path when real model credentials are present. Credentials are detected via
+//! the [`E2E_CREDENTIALS_ENV_VAR`] environment variable (`ANTHROPIC_API_KEY`),
+//! the same variable the Anthropic provider authenticates from. When it is
+//! unset every lane prints a skip message and returns early instead of
+//! panicking on a missing provider, so the suite stays green without paid
+//! credentials.
+//!
+//! The signal is intentionally env-var-only: a Zed sign-in (cloud/keychain) auth
+//! without `ANTHROPIC_API_KEY` set will also skip these lanes. Export the
+//! variable to opt into the live path.
+//!
+//! Run them live with, for example (`--nocapture` surfaces the skip messages
+//! when credentials are absent):
+//! `ANTHROPIC_API_KEY=… cargo test -p agent --features e2e common_e2e -- --test-threads=1 --nocapture`
+
 use crate::{AgentServer, AgentServerDelegate};
 use acp_thread::{AcpThread, AgentThreadEntry, ToolCall, ToolCallStatus};
 use agent_client_protocol::schema::v1 as acp;
@@ -17,11 +37,39 @@ use std::{
 use util::path;
 use util::path_list::PathList;
 
+/// Environment variable whose presence opts the live agent e2e lanes into the
+/// real model path. It matches the variable the Anthropic language-model
+/// provider authenticates from, so a set, non-empty value means the live path
+/// is reachable.
+pub const E2E_CREDENTIALS_ENV_VAR: &str = "ANTHROPIC_API_KEY";
+
+/// Returns whether real model credentials are available for the live e2e lanes.
+///
+/// Used as a skip guard: when it returns `false` the e2e tests print an
+/// actionable message and return early rather than panicking on a missing
+/// provider or an authentication failure.
+pub fn e2e_credentials_available() -> bool {
+    std::env::var(E2E_CREDENTIALS_ENV_VAR).is_ok_and(|value| !value.trim().is_empty())
+}
+
+macro_rules! skip_without_e2e_credentials {
+    ($name:literal) => {
+        if !e2e_credentials_available() {
+            eprintln!(
+                "skipping {}: no model credentials; set {} (or sign in) to run live agent e2e tests",
+                $name, E2E_CREDENTIALS_ENV_VAR,
+            );
+            return;
+        }
+    };
+}
+
 pub async fn test_basic<T, F>(server: F, cx: &mut TestAppContext)
 where
     T: AgentServer + 'static,
     F: AsyncFn(&Arc<dyn fs::Fs>, &mut TestAppContext) -> T,
 {
+    skip_without_e2e_credentials!("basic");
     let fs = init_test(cx).await as Arc<dyn fs::Fs>;
     let project = Project::test(fs.clone(), [], cx).await;
     let thread = new_test_thread(server(&fs, cx).await, project.clone(), "/private/tmp", cx).await;
@@ -53,6 +101,7 @@ where
     T: AgentServer + 'static,
     F: AsyncFn(&Arc<dyn fs::Fs>, &mut TestAppContext) -> T,
 {
+    skip_without_e2e_credentials!("path_mentions");
     let fs = init_test(cx).await as _;
 
     let tempdir = tempfile::tempdir().unwrap();
@@ -111,6 +160,7 @@ where
     T: AgentServer + 'static,
     F: AsyncFn(&Arc<dyn fs::Fs>, &mut TestAppContext) -> T,
 {
+    skip_without_e2e_credentials!("tool_call");
     let fs = init_test(cx).await as _;
 
     let tempdir = tempfile::tempdir().unwrap();
@@ -160,6 +210,7 @@ pub async fn test_tool_call_with_permission<T, F>(
     T: AgentServer + 'static,
     F: AsyncFn(&Arc<dyn fs::Fs>, &mut TestAppContext) -> T,
 {
+    skip_without_e2e_credentials!("tool_call_with_permission");
     let fs = init_test(cx).await as Arc<dyn fs::Fs>;
     let project = Project::test(fs.clone(), [path!("/private/tmp").as_ref()], cx).await;
     let thread = new_test_thread(server(&fs, cx).await, project.clone(), "/private/tmp", cx).await;
@@ -257,6 +308,7 @@ where
     T: AgentServer + 'static,
     F: AsyncFn(&Arc<dyn fs::Fs>, &mut TestAppContext) -> T,
 {
+    skip_without_e2e_credentials!("cancel");
     let fs = init_test(cx).await as Arc<dyn fs::Fs>;
 
     let project = Project::test(fs.clone(), [path!("/private/tmp").as_ref()], cx).await;
@@ -330,6 +382,7 @@ where
     T: AgentServer + 'static,
     F: AsyncFn(&Arc<dyn fs::Fs>, &mut TestAppContext) -> T,
 {
+    skip_without_e2e_credentials!("thread_drop");
     let fs = init_test(cx).await as Arc<dyn fs::Fs>;
     let project = Project::test(fs.clone(), [], cx).await;
     let thread = new_test_thread(server(&fs, cx).await, project.clone(), "/private/tmp", cx).await;
