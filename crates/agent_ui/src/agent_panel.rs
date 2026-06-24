@@ -11177,6 +11177,49 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn collab_session_still_resolves_native_agent(cx: &mut TestAppContext) {
+        // AGE-683: the native-agent picker demotion (AGE-678) is UI-only. A
+        // collaboration session (guest in a shared project) must still resolve
+        // the native agent, and the picker must still offer it in collab.
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        // Non-collab: OMP is the default/primary agent.
+        project.read_with(cx, |project, _| assert!(!project.is_via_collab()));
+
+        // Flip to a collab (guest) project, as when joining a shared project.
+        project.update(cx, |project, _| project.mark_as_collab_for_testing());
+        project.read_with(cx, |project, _| assert!(project.is_via_collab()));
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        // The panel resolves the native agent in collab regardless of the picker
+        // demotion, and the picker still offers it in a collab session.
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.selected_agent(cx), Agent::NativeAgent);
+        });
+        assert!(AgentPanel::native_agent_offered_in_picker(true));
+    }
+
+    #[gpui::test]
     fn test_resolve_worktree_branch_target() {
         let resolved = git_ui::worktree_service::resolve_worktree_branch_target(
             &NewWorktreeBranchTarget::ExistingBranch {
