@@ -1,8 +1,7 @@
 use crate::{AgentServer, AgentServerDelegate};
 use acp_thread::{
-    AcpThread, AgentConnection, CommandCategory, Subagent, UiRequest, UiRequestKind,
-    UiRequestOption, UiRequestScope, UiResponse, UserMessageId, meta_with_command_category,
-    meta_with_tool_name,
+    AcpThread, AgentConnection, Subagent, UiRequest, UiRequestKind, UiRequestOption,
+    UiRequestScope, UiResponse, UserMessageId, meta_with_tool_name,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
@@ -1660,8 +1659,11 @@ fn parse_available_command(command: &Value) -> Option<acp::AvailableCommand> {
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let mut mapped = acp::AvailableCommand::new(name.to_owned(), description.to_owned())
-        .meta(meta_with_command_category(CommandCategory::Native));
+    // OMP parses its own slash commands, so the full `/command args` line must
+    // reach it verbatim as one prompt. Leaving the command uncategorized (no
+    // Native meta) stops Zed from stripping the name and queueing the argument
+    // as a separate prompt — `leading_native_command` only matches Native.
+    let mut mapped = acp::AvailableCommand::new(name.to_owned(), description.to_owned());
     if let Some(hint) = command
         .get("input")
         .and_then(|input| input.get("hint"))
@@ -3492,6 +3494,13 @@ mod tests {
         assert!(
             commands[1].input.is_some(),
             "hint maps to unstructured input"
+        );
+        // OMP commands carry no category, so Zed sends the full `/command args`
+        // line to the agent instead of stripping the name and queueing the
+        // argument as a separate prompt (`leading_native_command` is Native-only).
+        assert!(
+            acp_thread::command_category_from_meta(&commands[1].meta).is_none(),
+            "omp commands must not be Native, or their arguments get split off"
         );
     }
 
