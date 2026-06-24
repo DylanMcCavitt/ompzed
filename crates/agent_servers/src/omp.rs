@@ -1110,7 +1110,7 @@ impl OmpSessionState {
             UiResponse::Deny => json!({ "confirmed": false }),
             UiResponse::Cancel => json!({ "cancelled": true }),
             UiResponse::Input(value) => json!({ "value": value }),
-            UiResponse::Select(option_id) => json!({ "selected": option_id.to_string() }),
+            UiResponse::Select(option_id) => json!({ "value": option_id.to_string() }),
         };
         self.send_frame(ui_response_frame(request_id, payload))
             .log_err();
@@ -2637,6 +2637,9 @@ mod tests {
                             select)
                               printf '{{"type":"extension_ui_request","id":"ui-1","method":"select","message":"Pick one","options":[{{"value":"a","label":"Option A"}},{{"value":"b","label":"Option B"}}]}}\n'
                               ;;
+                            tool_gate)
+                              printf '{{"type":"extension_ui_request","id":"ui-1","method":"select","title":"Allow tool: task","options":["Approve","Deny"]}}\n'
+                              ;;
                             queue)
                               printf '{{"type":"extension_ui_request","id":"ui-1","method":"confirm","message":"First?","tool":"write","path":"a.txt"}}\n'
                               printf '{{"type":"extension_ui_request","id":"ui-2","method":"confirm","message":"Second?","tool":"write","path":"b.txt"}}\n'
@@ -2652,8 +2655,17 @@ mod tests {
                               delta="input:$value"
                               ;;
                             select)
-                              sel=$(printf '%s\n' "$line" | sed -n 's/.*"selected":"\([^"]*\)".*/\1/p')
+                              sel=$(printf '%s\n' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
                               delta="selected:$sel"
+                              ;;
+                            tool_gate)
+                              val=$(printf '%s\n' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+                              if [ "$val" = "Approve" ]; then
+                                touch "{mutation_path}"
+                                delta="gate:approved"
+                              else
+                                delta="gate:denied"
+                              fi
                               ;;
                             *)
                               case "$line" in
@@ -2847,9 +2859,46 @@ mod tests {
         send.await.unwrap();
         cx.run_until_parked();
 
-        assert!(fixture.responses().contains("\"selected\":\"b\""));
+        assert!(fixture.responses().contains("\"value\":\"b\""));
         thread.read_with(cx, |thread, cx| {
             assert!(thread.to_markdown(cx).contains("selected:b"));
+        });
+    }
+
+    /// Regression: a real OMP tool gate arrives as `method:"select"` with plain
+    /// string options `["Approve","Deny"]`. Approving must round-trip the choice
+    /// as the `value` field — OMP ignores `selected`, so the wrong field silently
+    /// denied every gated tool (e.g. `task`) even when the user clicked Approve.
+    #[gpui::test]
+    async fn omp_tool_gate_select_approve_sends_value_and_runs(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpUi::new("tool_gate");
+        let (_connection, thread) = start_ui_session(&fixture, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("spawn subagents", cx));
+        let id = wait_for_ui_requests(&thread, 1, cx).await.remove(0);
+        thread.read_with(cx, |thread, _| {
+            let request = &thread.ui_requests()[0];
+            assert_eq!(request.kind, UiRequestKind::Select);
+            let options: Vec<&str> = request.options.iter().map(|o| o.id.as_ref()).collect();
+            assert_eq!(options, vec!["Approve", "Deny"]);
+        });
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(id, UiResponse::Select("Approve".into()), cx)
+        });
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            fixture.responses().contains("\"value\":\"Approve\""),
+            "approval must round-trip as the `value` field, not `selected`"
+        );
+        assert!(
+            fixture.mutation_path.exists(),
+            "approving the gate must let the tool run"
+        );
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.to_markdown(cx).contains("gate:approved"));
         });
     }
 
