@@ -7,6 +7,9 @@ use std::{env, str::FromStr, sync::LazyLock};
 use gpui::{App, Global};
 use semver::Version;
 
+// Retained pending Ompzed docs infrastructure — see
+// docs/src/omp/distribution-identity.md. Ompzed has no docs host yet, so this
+// still points at Zed's published documentation.
 const ZED_DOCS_URL: &str = "https://zed.dev/docs";
 
 /// stable | dev | nightly | preview
@@ -30,10 +33,10 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Zed-Editor-Dev",
-        ReleaseChannel::Nightly => "Zed-Editor-Nightly",
-        ReleaseChannel::Preview => "Zed-Editor-Preview",
-        ReleaseChannel::Stable => "Zed-Editor-Stable",
+        ReleaseChannel::Dev => "Ompzed-Dev",
+        ReleaseChannel::Nightly => "Ompzed-Nightly",
+        ReleaseChannel::Preview => "Ompzed-Preview",
+        ReleaseChannel::Stable => "Ompzed-Stable",
     }
 }
 

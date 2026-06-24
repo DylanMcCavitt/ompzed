@@ -1,23 +1,24 @@
 #!/usr/bin/env sh
 set -eu
 
-# Uninstalls Zed that was installed using the install.sh script
+# Uninstalls Ompzed that was installed using the install.sh script
 
 check_remaining_installations() {
     platform="$(uname -s)"
     if [ "$platform" = "Darwin" ]; then
-        # Check for any Zed variants in /Applications
-        remaining=$(ls -d /Applications/Zed*.app 2>/dev/null | wc -l)
+        # Check for any Ompzed variants in /Applications
+        remaining=$(ls -d /Applications/Ompzed*.app 2>/dev/null | wc -l)
         [ "$remaining" -eq 0 ]
     else
-        # Check for any Zed variants in ~/.local
+        # Check for any Ompzed variants in ~/.local (bundle dir name is build
+        # output, still `zed*.app`; see docs/src/omp/distribution-identity.md)
         remaining=$(ls -d "$HOME/.local/zed"*.app 2>/dev/null | wc -l)
         [ "$remaining" -eq 0 ]
     fi
 }
 
 prompt_remove_preferences() {
-    printf "Do you want to keep your Zed preferences? [Y/n] "
+    printf "Do you want to keep your Ompzed preferences? [Y/n] "
     read -r response
     case "$response" in
         [nN]|[nN][oO])
@@ -45,7 +46,7 @@ main() {
 
     "$platform"
 
-    echo "Zed has been uninstalled"
+    echo "Ompzed has been uninstalled"
 }
 
 linux() {
@@ -58,24 +59,24 @@ linux() {
     db_suffix="stable"
     case "$channel" in
       stable)
-        appid="dev.zed.Zed"
+        appid="dev.ompzed.Ompzed"
         db_suffix="stable"
         ;;
       nightly)
-        appid="dev.zed.Zed-Nightly"
+        appid="dev.ompzed.Ompzed-Nightly"
         db_suffix="nightly"
         ;;
       preview)
-        appid="dev.zed.Zed-Preview"
+        appid="dev.ompzed.Ompzed-Preview"
         db_suffix="preview"
         ;;
       dev)
-        appid="dev.zed.Zed-Dev"
+        appid="dev.ompzed.Ompzed-Dev"
         db_suffix="dev"
         ;;
       *)
         echo "Unknown release channel: ${channel}. Using stable app ID."
-        appid="dev.zed.Zed"
+        appid="dev.ompzed.Ompzed"
         db_suffix="stable"
         ;;
     esac
@@ -89,40 +90,42 @@ linux() {
     # Remove the .desktop file
     rm -f "$HOME/.local/share/applications/${appid}.desktop"
 
-    # Remove the database directory for this channel
-    rm -rf "$HOME/.local/share/zed/db/0-$db_suffix"
+    # Remove the database directory for this channel (data dir is APP_NAME-keyed)
+    rm -rf "$HOME/.local/share/ompzed/db/0-$db_suffix"
 
-    # Remove socket file
-    rm -f "$HOME/.local/share/zed/zed-$db_suffix.sock"
+    # Remove socket file (the `zed-` filename prefix is hardcoded in the app)
+    rm -f "$HOME/.local/share/ompzed/zed-$db_suffix.sock"
 
-    # Remove the entire Zed directory if no installations remain
+    # Remove the entire Ompzed data directory if no installations remain
     if check_remaining_installations; then
-        rm -rf "$HOME/.local/share/zed"
+        rm -rf "$HOME/.local/share/ompzed"
         prompt_remove_preferences
     fi
 
+    # `.zed_server` is the hardcoded remote-host server dir (not APP_NAME-keyed);
+    # see docs/src/omp/distribution-identity.md.
     rm -rf $HOME/.zed_server
 }
 
 macos() {
-    app="Zed.app"
+    app="Ompzed.app"
     db_suffix="stable"
-    app_id="dev.zed.Zed"
+    app_id="dev.ompzed.Ompzed"
     case "$channel" in
       nightly)
-        app="Zed Nightly.app"
+        app="Ompzed Nightly.app"
         db_suffix="nightly"
-        app_id="dev.zed.Zed-Nightly"
+        app_id="dev.ompzed.Ompzed-Nightly"
         ;;
       preview)
-        app="Zed Preview.app"
+        app="Ompzed Preview.app"
         db_suffix="preview"
-        app_id="dev.zed.Zed-Preview"
+        app_id="dev.ompzed.Ompzed-Preview"
         ;;
       dev)
-        app="Zed Dev.app"
+        app="Ompzed Dev.app"
         db_suffix="dev"
-        app_id="dev.zed.Zed-Dev"
+        app_id="dev.ompzed.Ompzed-Dev"
         ;;
     esac
 
@@ -134,8 +137,8 @@ macos() {
     # Remove the binary symlink
     rm -f "$HOME/.local/bin/zed"
 
-    # Remove the database directory for this channel
-    rm -rf "$HOME/Library/Application Support/Zed/db/0-$db_suffix"
+    # Remove the database directory for this channel (data dir is APP_NAME-keyed)
+    rm -rf "$HOME/Library/Application Support/Ompzed/db/0-$db_suffix"
 
     # Remove app-specific files and directories
     rm -rf "$HOME/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments/$app_id.sfl"*
@@ -144,10 +147,10 @@ macos() {
     rm -rf "$HOME/Library/Preferences/$app_id.plist"
     rm -rf "$HOME/Library/Saved Application State/$app_id.savedState"
 
-    # Remove the entire Zed directory if no installations remain
+    # Remove the entire Ompzed directory if no installations remain
     if check_remaining_installations; then
-        rm -rf "$HOME/Library/Application Support/Zed"
-        rm -rf "$HOME/Library/Logs/Zed"
+        rm -rf "$HOME/Library/Application Support/Ompzed"
+        rm -rf "$HOME/Library/Logs/Ompzed"
 
         prompt_remove_preferences
     fi

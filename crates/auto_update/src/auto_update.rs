@@ -321,9 +321,12 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
             auto_updater.client.http_client().build_url(&path)
         }
         ReleaseChannel::Nightly => {
-            "https://github.com/zed-industries/zed/commits/nightly/".to_string()
+            "https://github.com/DylanMcCavitt/ompzed/commits/nightly/".to_string()
         }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
+        // Stable/Preview notes derive from `server_url` (deployment infra,
+        // retained — see docs/src/omp/distribution-identity.md); Nightly/Dev
+        // point at the Ompzed fork's commit history.
+        ReleaseChannel::Dev => "https://github.com/DylanMcCavitt/ompzed/commits/main/".to_string(),
     };
     Some(url)
 }

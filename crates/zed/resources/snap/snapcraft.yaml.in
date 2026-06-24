@@ -1,23 +1,25 @@
-name: zed
-title: Zed
+name: ompzed
+title: Ompzed
 base: core24
 version: "$RELEASE_VERSION"
-summary: The editor for what's next
+summary: An OMP-native code editor
 description: |
-  Zed is a modern open-source code editor, built from the ground up in Rust with
-  a GPU-accelerated renderer. We help you build software faster than ever before.
+  Ompzed is an OMP-native fork of the Zed code editor, built in Rust with a
+  GPU-accelerated renderer and the Oh My Pi agent as a first-class citizen.
 grade: stable
 confinement: classic
 compression: lzo
-website: https://zed.dev/
-source-code: https://github.com/zed-industries/zed
-issues: https://github.com/zed-industries/zed/issues
-contact: https://zed.dev/community-links#support-and-feedback
+website: https://github.com/DylanMcCavitt/ompzed
+source-code: https://github.com/DylanMcCavitt/ompzed
+issues: https://github.com/DylanMcCavitt/ompzed/issues
+contact: https://github.com/DylanMcCavitt/ompzed/issues
 
 parts:
-  zed:
+  ompzed:
     plugin: dump
-    source: "https://github.com/zed-industries/zed/releases/download/v$RELEASE_VERSION/zed-linux-x86_64.tar.gz"
+    # The Ompzed fork must publish this release artifact; this no longer pulls
+    # an upstream Zed binary. See docs/src/omp/distribution-identity.md.
+    source: "https://github.com/DylanMcCavitt/ompzed/releases/download/v$RELEASE_VERSION/zed-linux-x86_64.tar.gz"
 
     organize:
       # These renames seem to not be necessary, but it's tidier.
@@ -26,11 +28,11 @@ parts:
 
     stage-packages:
       - libasound2t64
-      # snapcraft has a lint that this is unused, but without it Zed exits with
-      # "Missing Vulkan entry points: LibraryLoadFailure" in wgpu.
+      # snapcraft has a lint that this is unused, but without it Ompzed exits
+      # with "Missing Vulkan entry points: LibraryLoadFailure" in wgpu.
       - libvulkan1
-      # snapcraft has a lint that this is unused, but without it Zed exits with
-      # "NoWaylandLib" when run with Wayland.
+      # snapcraft has a lint that this is unused, but without it Ompzed exits
+      # with "NoWaylandLib" when run with Wayland.
       - libwayland-client0
       - libxcb1
       - libxkbcommon-x11-0
@@ -52,8 +54,10 @@ parts:
       - -usr/share/man
 
 apps:
-  zed:
+  ompzed:
+    # The bundled binary is still named `zed` (build output); see
+    # docs/src/omp/distribution-identity.md.
     command: usr/bin/zed
-    common-id: dev.zed.Zed
+    common-id: dev.ompzed.Ompzed
     environment:
       ZED_BUNDLE_TYPE: snap
