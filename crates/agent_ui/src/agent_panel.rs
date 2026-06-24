@@ -5844,6 +5844,45 @@ impl AgentPanel {
         })
     }
 
+    /// Always-on OMP discovery banner for the uninitialized panel: surfaces the
+    /// workspace's `omp` binary/config/command status proactively, before a
+    /// session launch is attempted (AGE-664). Reads the shipped, tested
+    /// `OmpDiscovery::status_label` (AGE-642); adds no discovery logic.
+    fn render_omp_discovery_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let work_dir = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()?
+            .read(cx)
+            .abs_path();
+        let settings = agent_servers::OmpSettings::get_global(cx);
+        let discovery = agent_servers::discover_omp(
+            settings.binary_path.as_deref(),
+            settings.config_dir.as_deref(),
+            work_dir.as_ref(),
+        );
+        let (icon, icon_color) = if discovery.binary_available() {
+            (IconName::Check, Color::Muted)
+        } else {
+            (IconName::Warning, Color::Warning)
+        };
+        Some(
+            h_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .child(Icon::new(icon).size(IconSize::XSmall).color(icon_color))
+                .child(
+                    Label::new(discovery.status_label())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_server_store = self.project.read(cx).agent_server_store().clone();
 
@@ -6628,7 +6667,9 @@ impl Render for AgentPanel {
                 VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
                     parent.child(self.render_no_project_state(cx))
                 }
-                VisibleSurface::Uninitialized => parent,
+                VisibleSurface::Uninitialized => {
+                    parent.children(self.render_omp_discovery_banner(cx))
+                }
                 VisibleSurface::AgentThread(conversation_view) => parent
                     .child(conversation_view.clone())
                     .child(self.render_drag_target(cx)),
