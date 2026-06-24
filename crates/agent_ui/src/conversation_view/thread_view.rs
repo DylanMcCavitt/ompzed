@@ -573,6 +573,9 @@ pub struct ThreadView {
     /// The prompt view for the head of the thread's pending UI-request queue,
     /// rebuilt when the head request id changes.
     ui_request_prompt: Option<Entity<crate::ui_request_prompt::UiRequestPrompt>>,
+    /// The subagent telemetry tree for the active thread, created lazily once a
+    /// runtime surfaces child agents and rebound when the thread changes.
+    subagent_tree: Option<Entity<crate::subagent_tree::SubagentTree>>,
     pub(super) thread_error: Option<ThreadError>,
     pub thread_error_markdown: Option<Entity<Markdown>>,
     pub token_limit_callout_dismissed: bool,
@@ -957,6 +960,7 @@ impl ThreadView {
             permission_dropdown_handle: PopoverMenuHandle::default(),
             thread_retry_status: None,
             ui_request_prompt: None,
+            subagent_tree: None,
             thread_error: None,
             thread_error_markdown: None,
             token_limit_callout_dismissed: false,
@@ -2841,6 +2845,27 @@ impl ThreadView {
         self.ui_request_prompt
             .clone()
             .map(|prompt| prompt.into_any_element())
+    }
+
+    /// Render the subagent telemetry tree for the active thread, created lazily
+    /// the first time a runtime surfaces child agents and rebound if the bound
+    /// thread changes. Renders nothing until subagents exist.
+    fn render_subagent_tree(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.thread.read(cx).subagents().is_empty() {
+            return None;
+        }
+        let bound = self
+            .subagent_tree
+            .as_ref()
+            .is_some_and(|tree| tree.read(cx).thread() == &self.thread);
+        if !bound {
+            let thread = self.thread.clone();
+            self.subagent_tree =
+                Some(cx.new(|cx| crate::subagent_tree::SubagentTree::new(thread, cx)));
+        }
+        self.subagent_tree
+            .clone()
+            .map(|tree| tree.into_any_element())
     }
 
     fn activity_bar_bg(&self, cx: &Context<Self>) -> Hsla {
@@ -11357,6 +11382,7 @@ impl Render for ThreadView {
                 |this, version| this.child(self.render_new_version_callout(&version, cx)),
             )
             .children(self.render_token_limit_callout(cx))
+            .children(self.render_subagent_tree(cx))
             .children(self.render_ui_request_prompt(window, cx))
             .child(self.render_message_editor(window, cx))
     }

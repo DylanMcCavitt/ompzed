@@ -1,7 +1,7 @@
 use crate::{AgentServer, AgentServerDelegate};
 use acp_thread::{
-    AcpThread, AgentConnection, UiRequest, UiRequestKind, UiRequestOption, UiRequestScope,
-    UiResponse, UserMessageId, meta_with_tool_name,
+    AcpThread, AgentConnection, Subagent, UiRequest, UiRequestKind, UiRequestOption,
+    UiRequestScope, UiResponse, UserMessageId, meta_with_tool_name,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
@@ -11,7 +11,7 @@ use futures::{
     AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _, channel::oneshot,
     io::BufReader,
 };
-use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, SharedString, Subscription, Task};
 use project::{AgentId, Project};
 use serde_json::{Value, json};
 use settings::Settings as _;
@@ -304,7 +304,9 @@ impl OmpAgentConnection {
     fn dispose_all(&self, cx: &mut App) {
         for (_, session) in self.sessions.borrow_mut().drain() {
             session.state.cancel_active_turn();
-            session.state.reject_pending_requests("OMP agent shutting down");
+            session
+                .state
+                .reject_pending_requests("OMP agent shutting down");
             session.state.kill(cx);
         }
     }
@@ -340,8 +342,9 @@ impl OmpAgentConnection {
         let connection = self.clone();
         cx.spawn(async move |cx| {
             let resume_id = resume.as_ref().map(|session_id| session_id.0.to_string());
-            let state = cx
-                .update(|cx| OmpSessionState::spawn(command, &work_dir, resume_id.as_deref(), cx))?;
+            let state = cx.update(|cx| {
+                OmpSessionState::spawn(command, &work_dir, resume_id.as_deref(), cx)
+            })?;
 
             // Learn OMP's own session identity/provenance. A fresh session
             // adopts it as the persisted id; a resume keeps the saved id.
@@ -370,13 +373,16 @@ impl OmpAgentConnection {
                 })
             });
             state.set_thread(thread.downgrade());
+            state.enable_subagent_telemetry();
             if let Some(descriptor) = descriptor.as_ref() {
                 state.apply_descriptor(descriptor, cx);
             }
-            connection
-                .sessions
-                .borrow_mut()
-                .insert(session_id, OmpSession { state: state.clone() });
+            connection.sessions.borrow_mut().insert(
+                session_id,
+                OmpSession {
+                    state: state.clone(),
+                },
+            );
             if resume.is_some() {
                 state.clone().replay_history(cx).await;
             }
@@ -525,6 +531,11 @@ struct OmpSessionState {
     /// answered. Removed when answered, or cleared on cancel/exit so a request
     /// can never be answered twice or after the session is cancelled.
     pending_ui_requests: RefCell<HashSet<String>>,
+    /// Maps a tool-call id to the subagent that made it, learned from streamed
+    /// `subagent_event` tool executions. A child's `parentToolCallId` is
+    /// resolved through this map to its parent subagent's id; an id absent here
+    /// was a main-agent tool call, so that child is a tree root.
+    subagent_tool_owners: RefCell<HashMap<String, SharedString>>,
     closed: Cell<bool>,
     next_request_id: Cell<u64>,
     _read_task: Task<()>,
@@ -619,6 +630,7 @@ impl OmpSessionState {
                 pending_prompt: RefCell::default(),
                 pending_requests: RefCell::default(),
                 pending_ui_requests: RefCell::default(),
+                subagent_tool_owners: RefCell::default(),
                 closed: Cell::new(false),
                 next_request_id: Cell::new(0),
                 _read_task: read_task,
@@ -656,6 +668,19 @@ impl OmpSessionState {
         self.send_frame(json!({
             "type": "abort",
             "id": self.next_request_id(),
+        }))
+        .log_err();
+    }
+
+    /// Turn on subagent telemetry for this session so OMP streams
+    /// `subagent_lifecycle`/`subagent_progress`/`subagent_event` frames as the
+    /// agent spawns child agents. Sent once after the session is established;
+    /// fire-and-forget (OMP's ack arrives as a `response` we don't await).
+    fn enable_subagent_telemetry(&self) {
+        self.send_frame(json!({
+            "type": "set_subagent_subscription",
+            "id": self.next_request_id(),
+            "level": "events",
         }))
         .log_err();
     }
@@ -748,6 +773,10 @@ impl OmpSessionState {
             Some("turn_end") => self.handle_turn_end(&frame),
             Some("history_message") => self.handle_history_message(&frame, cx),
             Some("extension_ui_request") => self.handle_ui_request(&frame, cx),
+            Some("subagent_lifecycle") | Some("subagent_progress") => {
+                self.handle_subagent_telemetry(&frame, cx)
+            }
+            Some("subagent_event") => self.handle_subagent_event(&frame, cx),
             _ => {}
         }
     }
@@ -999,6 +1028,73 @@ impl OmpSessionState {
 
         self.pending_ui_requests.borrow_mut().insert(id.to_owned());
         thread.update(cx, |thread, cx| thread.push_ui_request(request, cx));
+    }
+
+    /// Upgrade the attached panel thread and run `f` against it, if a panel is
+    /// still attached. Telemetry frames are best-effort: with no panel they are
+    /// silently dropped (nothing to render into).
+    fn update_thread(
+        &self,
+        cx: &mut AsyncApp,
+        f: impl FnOnce(&mut AcpThread, &mut Context<AcpThread>),
+    ) {
+        let Some(thread) = self
+            .thread
+            .borrow()
+            .as_ref()
+            .and_then(|thread| thread.upgrade())
+        else {
+            return;
+        };
+        thread.update(cx, f);
+    }
+
+    /// Surface a `subagent_lifecycle`/`subagent_progress` frame as a telemetry
+    /// node, merged into the tree by id so live progress never duplicates nodes.
+    fn handle_subagent_telemetry(&self, frame: &Value, cx: &mut AsyncApp) {
+        let Some(mut subagent) = frame.get("payload").and_then(parse_subagent) else {
+            return;
+        };
+        // Resolve the raw parent tool-call id to the subagent that made it. An
+        // id no subagent owns was a main-agent tool call, so this child is a
+        // tree root (`parent_id` stays `None`).
+        subagent.parent_id = subagent.parent_id.and_then(|tool_id| {
+            self.subagent_tool_owners
+                .borrow()
+                .get(tool_id.as_ref())
+                .cloned()
+        });
+        self.update_thread(cx, |thread, cx| thread.upsert_subagent(subagent, cx));
+    }
+
+    /// Append one streamed child event to the matching subagent's drill-in
+    /// transcript, so an open inspector tails it incrementally. A child's tool
+    /// executions are recorded as tool-call ownership so a grandchild's
+    /// `parentToolCallId` resolves to this subagent, nesting the tree.
+    fn handle_subagent_event(&self, frame: &Value, cx: &mut AsyncApp) {
+        let Some(payload) = frame.get("payload") else {
+            return;
+        };
+        let Some(id) = payload.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(event) = payload.get("event") else {
+            return;
+        };
+        if event.get("type").and_then(Value::as_str) == Some("tool_execution_start")
+            && let Some(tool_call_id) = subagent_event_tool_call_id(event)
+        {
+            self.subagent_tool_owners
+                .borrow_mut()
+                .insert(tool_call_id.to_owned(), id.to_owned().into());
+        }
+        let Some(line) = subagent_event_line(event) else {
+            return;
+        };
+        let id: SharedString = id.to_owned().into();
+        self.update_thread(cx, |thread, cx| {
+            thread.append_subagent_event_line(id, line, cx)
+        });
     }
 
     /// Routes the user's answer to a surfaced UI request back to OMP, keyed by
@@ -1340,6 +1436,115 @@ fn ui_response_frame(id: &str, payload: Value) -> Value {
         }
     }
     frame
+}
+/// Parse a `subagent_lifecycle`/`subagent_progress` payload into a normalized
+/// [`Subagent`]. Lifecycle frames carry id/agent/status at the payload top
+/// level; progress frames nest the live counters (and the id/status) under
+/// `payload.progress`, so each field is read from whichever place it appears.
+/// Fields a given frame omits are left `None`/empty so the merge in
+/// [`AcpThread::upsert_subagent`] never clobbers an earlier value.
+fn parse_subagent(payload: &Value) -> Option<Subagent> {
+    let progress = payload.get("progress");
+    let from_either = |key: &str| -> Option<&str> {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .or_else(|| progress.and_then(|p| p.get(key)).and_then(Value::as_str))
+    };
+    let id = from_either("id")?;
+    let one_line =
+        |text: &str| -> SharedString { text.lines().next().unwrap_or(text).to_owned().into() };
+    Some(Subagent {
+        id: id.to_owned().into(),
+        agent: from_either("agent").unwrap_or_default().to_owned().into(),
+        parent_id: payload
+            .get("parentToolCallId")
+            .and_then(Value::as_str)
+            .map(|parent| parent.to_owned().into()),
+        index: payload
+            .get("index")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                progress
+                    .and_then(|p| p.get("index"))
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0) as u32,
+        status: from_either("status").unwrap_or_default().to_owned().into(),
+        task: from_either("task")
+            .or_else(|| from_either("assignment"))
+            .map(one_line),
+        tool_count: progress
+            .and_then(|p| p.get("toolCount"))
+            .and_then(Value::as_u64)
+            .map(|count| count as u32),
+        tokens: progress
+            .and_then(|p| p.get("tokens"))
+            .and_then(Value::as_u64),
+        cost: progress.and_then(|p| p.get("cost")).and_then(Value::as_f64),
+        model: progress
+            .and_then(|p| p.get("resolvedModel"))
+            .and_then(Value::as_str)
+            .map(|model| model.to_owned().into()),
+        recent_tools: progress
+            .and_then(|p| p.get("recentTools"))
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|tool| tool.to_owned().into())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// Render one streamed child `AgentSessionEvent` (the `payload.event` of a
+/// `subagent_event` frame) as a single drill-in transcript line, or `None` to
+/// skip noisy partial-delta events. Only tool starts, finished assistant
+/// messages, and the terminal `agent_end` produce a line.
+fn subagent_event_line(event: &Value) -> Option<SharedString> {
+    match event.get("type").and_then(Value::as_str)? {
+        "tool_execution_start" => {
+            let name = event
+                .get("name")
+                .or_else(|| event.get("toolName"))
+                .and_then(Value::as_str)?;
+            Some(format!("→ {name}").into())
+        }
+        "message_end" => {
+            let message = event.get("message")?;
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                return None;
+            }
+            let text = assistant_message_text(message)?;
+            (!text.trim().is_empty()).then(|| text.into())
+        }
+        "agent_end" => Some("✓ finished".into()),
+        _ => None,
+    }
+}
+
+/// Concatenate the `text` blocks of a message's content array; `None` when the
+/// message has no textual content.
+fn assistant_message_text(message: &Value) -> Option<String> {
+    let blocks = message.get("content")?.as_array()?;
+    let text: String = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The tool-call id a child event refers to (`id` or `toolCallId`), used to
+/// record which subagent owns a spawning tool call.
+fn subagent_event_tool_call_id(event: &Value) -> Option<&str> {
+    event
+        .get("id")
+        .or_else(|| event.get("toolCallId"))
+        .and_then(Value::as_str)
 }
 
 #[cfg(all(test, unix))]
@@ -1897,8 +2102,7 @@ mod tests {
         // The app-quit hook runs dispose_all; no OMP child may outlive the app.
         cx.update(|cx| connection.dispose_all(cx));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while pids.iter().any(|pid| process_is_alive(*pid))
-            && std::time::Instant::now() < deadline
+        while pids.iter().any(|pid| process_is_alive(*pid)) && std::time::Instant::now() < deadline
         {
             cx.background_executor
                 .timer(Duration::from_millis(20))
@@ -2736,5 +2940,243 @@ mod tests {
         cx.update(|cx| connection.clone().close_session(&session_id, cx))
             .await
             .unwrap();
+    }
+
+    /// A fake OMP that, on a prompt, streams a recorded subagent telemetry
+    /// sequence: a main-agent `task` spawns `TaskA`/`TaskB` (roots), `TaskA`
+    /// makes its own `task` call (tool `t1`) and spawns the grandchild
+    /// `TaskA1`, progress frames update `TaskA` twice (dedup), and child events
+    /// feed the drill-in transcript. Frames are catted from a plain-JSON file
+    /// to avoid shell brace-escaping. No network, no paid omp.
+    struct FakeOmpSubagents {
+        dir: tempfile::TempDir,
+        script_path: PathBuf,
+    }
+
+    impl FakeOmpSubagents {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let script_path = dir.path().join("fake-omp-subagents.sh");
+            let frames_path = dir.path().join("frames.jsonl");
+            let frames = concat!(
+                r#"{"type":"subagent_lifecycle","payload":{"id":"TaskA","agent":"quick_task","parentToolCallId":"t0","status":"started","index":0}}"#,
+                "\n",
+                r#"{"type":"subagent_lifecycle","payload":{"id":"TaskB","agent":"quick_task","parentToolCallId":"t0","status":"started","index":1}}"#,
+                "\n",
+                r#"{"type":"subagent_progress","payload":{"agent":"quick_task","parentToolCallId":"t0","task":"read files","progress":{"id":"TaskA","status":"running","toolCount":1,"tokens":100,"cost":0.01,"resolvedModel":"claude","recentTools":["read"]}}}"#,
+                "\n",
+                r#"{"type":"subagent_event","payload":{"id":"TaskA","event":{"type":"tool_execution_start","id":"t1","name":"task"}}}"#,
+                "\n",
+                r#"{"type":"subagent_lifecycle","payload":{"id":"TaskA1","agent":"quick_task","parentToolCallId":"t1","status":"started","index":0}}"#,
+                "\n",
+                r#"{"type":"subagent_progress","payload":{"parentToolCallId":"t0","progress":{"id":"TaskA","status":"running","toolCount":2,"tokens":200,"cost":0.02}}}"#,
+                "\n",
+                r#"{"type":"subagent_event","payload":{"id":"TaskA","event":{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hello from A"}]}}}}"#,
+                "\n",
+                r#"{"type":"subagent_event","payload":{"id":"TaskB","event":{"type":"agent_end"}}}"#,
+                "\n",
+                r#"{"type":"subagent_progress","payload":{"parentToolCallId":"t0","progress":{"id":"TaskB","status":"completed","toolCount":0}}}"#,
+                "\n",
+                r#"{"type":"turn_end","message":{"stopReason":"endTurn"}}"#,
+                "\n",
+            );
+            fs::write(&frames_path, frames).unwrap();
+            fs::write(
+                &script_path,
+                formatdoc! {r#"
+                    #!/bin/sh
+                    while IFS= read -r line; do
+                      case "$line" in
+                        *'"type":"get_state"'*)
+                          id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+                          printf '{{"type":"response","id":"%s","success":true,"data":null}}\n' "$id"
+                          ;;
+                        *'"type":"set_subagent_subscription"'*)
+                          id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+                          printf '{{"type":"response","id":"%s","success":true,"data":{{"level":"events"}}}}\n' "$id"
+                          ;;
+                        *'"type":"prompt"'*)
+                          id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+                          printf '{{"type":"response","id":"%s","success":true,"data":null}}\n' "$id"
+                          cat "{frames_path}"
+                          ;;
+                        *'"type":"abort"'*)
+                          printf '{{"type":"response","success":true,"data":null}}\n'
+                          ;;
+                      esac
+                    done
+                "#,
+                    frames_path = frames_path.display(),
+                },
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script_path, permissions).unwrap();
+            Self { dir, script_path }
+        }
+
+        fn command(&self) -> OmpCommand {
+            OmpCommand {
+                program: self.script_path.clone(),
+                prefix_args: Vec::new(),
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn omp_subagent_frames_build_nested_tree_and_tail_transcript(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpSubagents::new();
+        let connection = Rc::new(OmpAgentConnection::new(fixture.command()));
+        let project = Project::example([fixture.dir.path()], &mut cx.to_async()).await;
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[fixture.dir.path()]), cx)
+            })
+            .await
+            .unwrap();
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("fan out", cx));
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            let subagents = thread.subagents();
+            assert_eq!(
+                subagents
+                    .iter()
+                    .filter(|node| node.id.as_ref() == "TaskA")
+                    .count(),
+                1,
+                "repeated TaskA frames must update in place, not duplicate"
+            );
+            assert_eq!(
+                subagents.len(),
+                3,
+                "TaskA, TaskB, and the grandchild TaskA1"
+            );
+
+            let task_a = subagents.iter().find(|n| n.id.as_ref() == "TaskA").unwrap();
+            let task_b = subagents.iter().find(|n| n.id.as_ref() == "TaskB").unwrap();
+            let task_a1 = subagents
+                .iter()
+                .find(|n| n.id.as_ref() == "TaskA1")
+                .unwrap();
+
+            // Parent/child structure: main's children are roots; TaskA1 nests
+            // under TaskA via the resolved tool-call ownership.
+            assert_eq!(task_a.parent_id, None, "TaskA spawned by the main agent");
+            assert_eq!(task_b.parent_id, None, "TaskB spawned by the main agent");
+            assert_eq!(
+                task_a1.parent_id.as_deref(),
+                Some("TaskA"),
+                "TaskA1 nests under TaskA"
+            );
+
+            // Progress merge: latest counter wins; an earlier-only field (the
+            // recentTools/model from the first progress) is not clobbered by the
+            // second progress frame that omits it.
+            assert_eq!(task_a.tool_count, Some(2));
+            assert_eq!(task_a.tokens, Some(200));
+            assert_eq!(task_a.recent_tools, vec![SharedString::from("read")]);
+            assert_eq!(task_a.model.as_deref(), Some("claude"));
+            assert_eq!(task_b.status.as_ref(), "completed");
+
+            // Drill-in transcript tails the streamed child events in order.
+            let a_lines: Vec<String> = thread
+                .subagent_transcript("TaskA")
+                .iter()
+                .map(SharedString::to_string)
+                .collect();
+            assert_eq!(
+                a_lines,
+                vec!["→ task".to_string(), "hello from A".to_string()]
+            );
+            let b_lines: Vec<String> = thread
+                .subagent_transcript("TaskB")
+                .iter()
+                .map(SharedString::to_string)
+                .collect();
+            assert_eq!(b_lines, vec!["✓ finished".to_string()]);
+        });
+    }
+
+    #[test]
+    fn parse_subagent_reads_lifecycle_and_nested_progress_shapes() {
+        let lifecycle: Value = serde_json::from_str(
+            r#"{"id":"TaskA","agent":"quick_task","parentToolCallId":"t0","status":"started","index":1}"#,
+        )
+        .unwrap();
+        let node = parse_subagent(&lifecycle).unwrap();
+        assert_eq!(node.id.as_ref(), "TaskA");
+        assert_eq!(node.agent.as_ref(), "quick_task");
+        assert_eq!(node.parent_id.as_deref(), Some("t0"));
+        assert_eq!(node.index, 1);
+        assert_eq!(node.status.as_ref(), "started");
+        assert_eq!(
+            node.tool_count, None,
+            "a lifecycle frame carries no counters"
+        );
+
+        let progress: Value = serde_json::from_str(
+            r#"{"agent":"quick_task","parentToolCallId":"t0","task":"do a thing\nsecond line","progress":{"id":"TaskA","status":"running","toolCount":3,"tokens":42,"cost":0.5,"resolvedModel":"gpt","recentTools":["read","edit"]}}"#,
+        )
+        .unwrap();
+        let node = parse_subagent(&progress).unwrap();
+        assert_eq!(
+            node.id.as_ref(),
+            "TaskA",
+            "id is read from the nested progress"
+        );
+        assert_eq!(node.status.as_ref(), "running");
+        assert_eq!(
+            node.task.as_deref(),
+            Some("do a thing"),
+            "task is the first line only"
+        );
+        assert_eq!(node.tool_count, Some(3));
+        assert_eq!(node.tokens, Some(42));
+        assert_eq!(node.cost, Some(0.5));
+        assert_eq!(node.model.as_deref(), Some("gpt"));
+        assert_eq!(
+            node.recent_tools,
+            vec![SharedString::from("read"), SharedString::from("edit")]
+        );
+    }
+
+    #[test]
+    fn subagent_event_line_renders_meaningful_events_only() {
+        let tool: Value =
+            serde_json::from_str(r#"{"type":"tool_execution_start","id":"t1","name":"read"}"#)
+                .unwrap();
+        assert_eq!(subagent_event_line(&tool).as_deref(), Some("→ read"));
+        let message: Value = serde_json::from_str(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(subagent_event_line(&message).as_deref(), Some("hi"));
+        let done: Value = serde_json::from_str(r#"{"type":"agent_end"}"#).unwrap();
+        assert_eq!(subagent_event_line(&done).as_deref(), Some("✓ finished"));
+        let delta: Value = serde_json::from_str(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            subagent_event_line(&delta),
+            None,
+            "partial deltas are skipped"
+        );
+        let tool_result: Value = serde_json::from_str(
+            r#"{"type":"message_end","message":{"role":"toolResult","content":[{"type":"text","text":"out"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            subagent_event_line(&tool_result),
+            None,
+            "non-assistant messages are skipped"
+        );
     }
 }

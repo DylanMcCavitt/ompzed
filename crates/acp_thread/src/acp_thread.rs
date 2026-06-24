@@ -1537,6 +1537,13 @@ pub struct AcpThread {
     /// select, editor, open-url), in arrival order. The panel renders the head
     /// first; each is answered exactly once via [`Self::respond_to_ui_request`].
     ui_requests: Vec<UiRequest>,
+    /// Live child-agent telemetry nodes surfaced by the runtime, keyed by
+    /// [`Subagent::id`]. Repeated frames update a node in place (never
+    /// duplicate) via [`Self::upsert_subagent`]; rendered as a nested tree.
+    subagents: Vec<Subagent>,
+    /// Per-subagent drill-in transcript lines, keyed by subagent id and
+    /// appended in arrival order as the runtime streams the child's events.
+    subagent_transcripts: HashMap<SharedString, Vec<SharedString>>,
 }
 
 struct StreamingTextBuffer {
@@ -1741,6 +1748,8 @@ impl AcpThread {
             ui_scroll_position: None,
             streaming_text_buffer: None,
             ui_requests: Vec::new(),
+            subagents: Vec::new(),
+            subagent_transcripts: HashMap::new(),
         }
     }
 
@@ -1788,6 +1797,75 @@ impl AcpThread {
             return;
         }
         self.ui_requests.clear();
+        cx.notify();
+    }
+
+    /// Live child-agent telemetry nodes in arrival order. The panel renders
+    /// these as a nested tree, linking children to parents by
+    /// [`Subagent::parent_id`].
+    pub fn subagents(&self) -> &[Subagent] {
+        &self.subagents
+    }
+
+    /// Merge a telemetry frame into the node keyed by [`Subagent::id`]: an
+    /// existing node is updated field-by-field (only fields the frame carries
+    /// overwrite, so a later frame never clobbers an earlier value), and an
+    /// unknown id is appended. This keeps live progress updates from
+    /// duplicating nodes.
+    pub fn upsert_subagent(&mut self, update: Subagent, cx: &mut Context<Self>) {
+        if let Some(node) = self.subagents.iter_mut().find(|node| node.id == update.id) {
+            if !update.agent.is_empty() {
+                node.agent = update.agent;
+            }
+            if update.parent_id.is_some() {
+                node.parent_id = update.parent_id;
+            }
+            node.index = update.index;
+            if !update.status.is_empty() {
+                node.status = update.status;
+            }
+            if update.task.is_some() {
+                node.task = update.task;
+            }
+            if update.tool_count.is_some() {
+                node.tool_count = update.tool_count;
+            }
+            if update.tokens.is_some() {
+                node.tokens = update.tokens;
+            }
+            if update.cost.is_some() {
+                node.cost = update.cost;
+            }
+            if update.model.is_some() {
+                node.model = update.model;
+            }
+            if !update.recent_tools.is_empty() {
+                node.recent_tools = update.recent_tools;
+            }
+        } else {
+            self.subagents.push(update);
+        }
+        cx.notify();
+    }
+
+    /// The drill-in transcript lines for one subagent, in arrival order; empty
+    /// when the id is unknown or has streamed no events yet.
+    pub fn subagent_transcript(&self, id: &str) -> &[SharedString] {
+        self.subagent_transcripts
+            .get(id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Append one streamed event line to a subagent's drill-in transcript so an
+    /// open inspector tails it incrementally.
+    pub fn append_subagent_event_line(
+        &mut self,
+        id: SharedString,
+        line: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        self.subagent_transcripts.entry(id).or_default().push(line);
         cx.notify();
     }
 

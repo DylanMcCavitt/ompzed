@@ -161,6 +161,38 @@ pub enum UiResponse {
     Select(SharedString),
 }
 
+/// A normalized, agent-neutral view of a child agent a runtime spawned during a
+/// turn, surfaced to the panel as a live telemetry node. Keyed by
+/// [`Subagent::id`]: repeated frames for the same id update the node in place
+/// via [`AcpThread::upsert_subagent`] rather than appending a duplicate. Fields
+/// a given frame does not carry are left `None`/empty so a later frame never
+/// clobbers a value an earlier one established.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Subagent {
+    /// Runtime-assigned stable id for this child (e.g. "TaskA"); the tree node key.
+    pub id: SharedString,
+    /// The child's agent type/role (e.g. "quick_task").
+    pub agent: SharedString,
+    /// Links this child to its parent node; `None` for a top-level child.
+    pub parent_id: Option<SharedString>,
+    /// Sibling ordering under the parent, as reported by the runtime.
+    pub index: u32,
+    /// Lifecycle/progress status label ("started", "running", "completed", ...).
+    pub status: SharedString,
+    /// One-line task or assignment summary, when known.
+    pub task: Option<SharedString>,
+    /// Cumulative tool-call count, when reported by a progress frame.
+    pub tool_count: Option<u32>,
+    /// Cumulative token usage, when reported.
+    pub tokens: Option<u64>,
+    /// Cumulative cost, when reported.
+    pub cost: Option<f64>,
+    /// Resolved model id, when reported.
+    pub model: Option<SharedString>,
+    /// Most recent tool names in arrival order, when reported.
+    pub recent_tools: Vec<SharedString>,
+}
+
 pub trait AgentConnection {
     fn agent_id(&self) -> AgentId;
 

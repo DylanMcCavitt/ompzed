@@ -33,6 +33,7 @@ mod thread_import;
 pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
 
+mod subagent_tree;
 pub mod threads_archive_view;
 mod ui;
 mod ui_request_prompt;
