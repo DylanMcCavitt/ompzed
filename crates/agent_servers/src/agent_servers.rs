@@ -1,5 +1,6 @@
 mod acp;
 mod custom;
+mod github_context;
 mod omp;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -10,6 +11,10 @@ use collections::{HashMap, HashSet};
 pub use custom::*;
 use fs::Fs;
 use http_client::read_no_proxy_from_env;
+pub use github_context::{
+    DEFAULT_LIMIT as GITHUB_CONTEXT_DEFAULT_LIMIT, GithubContext, GithubRef, GithubRepo,
+    fetch_github_context,
+};
 pub use omp::{
     OMP_AGENT_ID, OmpAgentConnection, OmpAgentServer, OmpDiscovery, OmpSettings, discover_omp,
 };
