@@ -175,17 +175,17 @@ export APP_CLI="zed"
 export APP_ICON="zed"
 export APP_ARGS="%U"
 if [[ "$channel" == "preview" ]]; then
-  export APP_NAME="Zed Preview"
-  APP_ID="dev.zed.Zed-Preview"
+  export APP_NAME="Ompzed Preview"
+  APP_ID="dev.ompzed.Ompzed-Preview"
 elif [[ "$channel" == "nightly" ]]; then
-  export APP_NAME="Zed Nightly"
-  APP_ID="dev.zed.Zed-Nightly"
+  export APP_NAME="Ompzed Nightly"
+  APP_ID="dev.ompzed.Ompzed-Nightly"
 elif [[ "$channel" == "dev" ]]; then
-  export APP_NAME="Zed Devel"
-  APP_ID="dev.zed.Zed-Dev"
+  export APP_NAME="Ompzed Devel"
+  APP_ID="dev.ompzed.Ompzed-Dev"
 else
-  export APP_NAME="Zed"
-  APP_ID="dev.zed.Zed"
+  export APP_NAME="Ompzed"
+  APP_ID="dev.ompzed.Ompzed"
 fi
 
 mkdir -p "${zed_dir}/share/applications"

@@ -1784,9 +1784,9 @@ struct Args {
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
     ///
     /// This overrides the default platform-specific data directory location.
-    /// On macOS, the default is `~/Library/Application Support/Zed`.
-    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/zed`.
-    /// On Windows, the default is `%LOCALAPPDATA%\Zed`.
+    /// On macOS, the default is `~/Library/Application Support/Ompzed`.
+    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/ompzed`.
+    /// On Windows, the default is `%LOCALAPPDATA%\Ompzed`.
     #[arg(long, value_name = "DIR", verbatim_doc_comment)]
     user_data_dir: Option<String>,
 
