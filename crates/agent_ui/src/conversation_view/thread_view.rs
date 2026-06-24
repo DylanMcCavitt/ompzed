@@ -580,6 +580,10 @@ pub struct ThreadView {
     /// lazily for OMP threads with a worktree and rebound when the thread
     /// changes.
     github_context: Option<Entity<crate::github_context::GithubContextView>>,
+    /// The read-only Linear context surface for the active OMP thread, created
+    /// lazily for OMP threads with a worktree and rebound when the thread
+    /// changes.
+    linear_context: Option<Entity<crate::linear_context::LinearContextView>>,
     pub(super) thread_error: Option<ThreadError>,
     pub thread_error_markdown: Option<Entity<Markdown>>,
     pub token_limit_callout_dismissed: bool,
@@ -966,6 +970,7 @@ impl ThreadView {
             ui_request_prompt: None,
             subagent_tree: None,
             github_context: None,
+            linear_context: None,
             thread_error: None,
             thread_error_markdown: None,
             token_limit_callout_dismissed: false,
@@ -2901,6 +2906,38 @@ impl ThreadView {
                 Some(cx.new(|cx| crate::github_context::GithubContextView::new(thread, cx)));
         }
         self.github_context
+            .clone()
+            .map(|view| view.into_any_element())
+    }
+
+    /// Render the read-only Linear context surface for the active thread. Gated
+    /// to OMP threads that have a worktree; created lazily and rebound if the
+    /// bound thread changes.
+    fn render_linear_context(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.agent_id != AgentId::new(agent_servers::OMP_AGENT_ID) {
+            return None;
+        }
+        if self
+            .thread
+            .read(cx)
+            .project()
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .is_none()
+        {
+            return None;
+        }
+        let bound = self
+            .linear_context
+            .as_ref()
+            .is_some_and(|view| view.read(cx).thread() == &self.thread);
+        if !bound {
+            let thread = self.thread.clone();
+            self.linear_context =
+                Some(cx.new(|cx| crate::linear_context::LinearContextView::new(thread, cx)));
+        }
+        self.linear_context
             .clone()
             .map(|view| view.into_any_element())
     }
@@ -11421,6 +11458,7 @@ impl Render for ThreadView {
             .children(self.render_token_limit_callout(cx))
             .children(self.render_subagent_tree(cx))
             .children(self.render_github_context(cx))
+            .children(self.render_linear_context(cx))
             .children(self.render_ui_request_prompt(window, cx))
             .child(self.render_message_editor(window, cx))
     }

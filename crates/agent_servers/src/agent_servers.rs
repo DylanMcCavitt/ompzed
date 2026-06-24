@@ -1,6 +1,7 @@
 mod acp;
 mod custom;
 mod github_context;
+mod linear_context;
 mod omp;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -14,6 +15,11 @@ use http_client::read_no_proxy_from_env;
 pub use github_context::{
     DEFAULT_LIMIT as GITHUB_CONTEXT_DEFAULT_LIMIT, GithubContext, GithubRef, GithubRepo,
     fetch_github_context,
+};
+pub use linear_context::{
+    LINEAR_CONTEXT_DEFAULT_LIMIT, LinearContext, LinearIssue, LinearTeam, build_linear_query,
+    clear_linear_api_key, connect_linear_from_env, fetch_linear_context, load_linear_context,
+    store_linear_api_key,
 };
 pub use omp::{
     OMP_AGENT_ID, OmpAgentConnection, OmpAgentServer, OmpDiscovery, OmpSettings, discover_omp,

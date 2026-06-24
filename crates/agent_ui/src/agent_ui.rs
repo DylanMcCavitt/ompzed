@@ -34,6 +34,7 @@ pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
 
 mod github_context;
+mod linear_context;
 mod subagent_tree;
 pub mod threads_archive_view;
 mod ui;
