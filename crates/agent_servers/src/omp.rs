@@ -1,7 +1,8 @@
 use crate::{AgentServer, AgentServerDelegate};
 use acp_thread::{
-    AcpThread, AgentConnection, Subagent, UiRequest, UiRequestKind, UiRequestOption,
-    UiRequestScope, UiResponse, UserMessageId, meta_with_tool_name,
+    AcpThread, AgentConnection, CommandCategory, Subagent, UiRequest, UiRequestKind,
+    UiRequestOption, UiRequestScope, UiResponse, UserMessageId, meta_with_command_category,
+    meta_with_tool_name,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
@@ -374,6 +375,7 @@ impl OmpAgentConnection {
             });
             state.set_thread(thread.downgrade());
             state.enable_subagent_telemetry();
+            state.flush_available_commands(cx);
             if let Some(descriptor) = descriptor.as_ref() {
                 state.apply_descriptor(descriptor, cx);
             }
@@ -536,6 +538,11 @@ struct OmpSessionState {
     /// resolved through this map to its parent subagent's id; an id absent here
     /// was a main-agent tool call, so that child is a tree root.
     subagent_tool_owners: RefCell<HashMap<String, SharedString>>,
+    /// Latest slash commands OMP reported via `available_commands_update`,
+    /// cached because the first update arrives at startup before the panel
+    /// thread is attached; flushed to the thread on attach and updated on each
+    /// later frame so the composer's command picker tracks the active session.
+    available_commands: RefCell<Vec<acp::AvailableCommand>>,
     closed: Cell<bool>,
     next_request_id: Cell<u64>,
     _read_task: Task<()>,
@@ -631,6 +638,7 @@ impl OmpSessionState {
                 pending_requests: RefCell::default(),
                 pending_ui_requests: RefCell::default(),
                 subagent_tool_owners: RefCell::default(),
+                available_commands: RefCell::default(),
                 closed: Cell::new(false),
                 next_request_id: Cell::new(0),
                 _read_task: read_task,
@@ -777,6 +785,9 @@ impl OmpSessionState {
                 self.handle_subagent_telemetry(&frame, cx)
             }
             Some("subagent_event") => self.handle_subagent_event(&frame, cx),
+            Some("available_commands_update") => self.handle_available_commands(&frame, cx),
+            Some("command_output") => self.handle_command_output(&frame, cx),
+            Some("prompt_result") => self.handle_prompt_result(&frame),
             _ => {}
         }
     }
@@ -786,15 +797,21 @@ impl OmpSessionState {
             return;
         };
         let is_error = frame.get("success").and_then(Value::as_bool) == Some(false);
-        if is_error
-            && self
-                .pending_prompt
-                .borrow()
-                .as_ref()
-                .is_some_and(|prompt| prompt.id == id)
-        {
-            if let Some(prompt) = self.pending_prompt.borrow_mut().take() {
-                prompt.tx.send(Err(anyhow!(response_error(&frame)))).ok();
+        let is_pending_prompt = self
+            .pending_prompt
+            .borrow()
+            .as_ref()
+            .is_some_and(|prompt| prompt.id == id);
+        if is_pending_prompt {
+            if is_error {
+                if let Some(prompt) = self.pending_prompt.borrow_mut().take() {
+                    prompt.tx.send(Err(anyhow!(response_error(&frame)))).ok();
+                }
+            } else if prompt_completed_locally(&frame) {
+                // A local-only prompt (e.g. a slash command OMP runs without a
+                // model turn) acks with `data.agentInvoked: false` and emits no
+                // `agent_end`/`turn_end`, so resolve the turn now or it hangs.
+                self.complete_prompt(acp::StopReason::EndTurn);
             }
             return;
         }
@@ -984,6 +1001,73 @@ impl OmpSessionState {
             thread
                 .update(cx, |thread, cx| thread.handle_session_update(update, cx))
                 .log_err();
+        }
+    }
+
+    /// Surface OMP's `available_commands_update` to the panel composer's slash
+    /// picker. Caches the latest list (the first update arrives at startup,
+    /// before the thread attaches) and pushes it when a thread is present.
+    fn handle_available_commands(&self, frame: &Value, cx: &mut AsyncApp) {
+        let commands = parse_available_commands(frame);
+        *self.available_commands.borrow_mut() = commands.clone();
+        self.send_session_update(
+            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
+                commands,
+            )),
+            cx,
+        );
+    }
+
+    /// Replay the cached command list once a thread is attached, covering the
+    /// startup `available_commands_update` that arrived before the panel.
+    fn flush_available_commands(&self, cx: &mut AsyncApp) {
+        let commands = self.available_commands.borrow().clone();
+        if commands.is_empty() {
+            return;
+        }
+        self.send_session_update(
+            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
+                commands,
+            )),
+            cx,
+        );
+    }
+
+    /// Surface the textual output of a local slash command (e.g. `/fast status`)
+    /// as an agent message chunk so it lands in the transcript.
+    fn handle_command_output(&self, frame: &Value, cx: &mut AsyncApp) {
+        if let Some(text) = frame
+            .get("text")
+            .or_else(|| frame.get("output"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            self.send_session_update(
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    text.to_owned().into(),
+                )),
+                cx,
+            );
+        }
+    }
+
+    /// A prompt accepted immediately but resolving local-only emits
+    /// `prompt_result` with `agentInvoked:false` and no `agent_end`; complete the
+    /// matching turn so it doesn't hang waiting for events that never arrive.
+    fn handle_prompt_result(&self, frame: &Value) {
+        if frame.get("agentInvoked").and_then(Value::as_bool) != Some(false) {
+            return;
+        }
+        let matches_pending = match frame.get("id").and_then(Value::as_str) {
+            Some(id) => self
+                .pending_prompt
+                .borrow()
+                .as_ref()
+                .is_some_and(|prompt| prompt.id == id),
+            None => self.pending_prompt.borrow().is_some(),
+        };
+        if matches_pending {
+            self.complete_prompt(acp::StopReason::EndTurn);
         }
     }
 
@@ -1545,6 +1629,50 @@ fn subagent_event_tool_call_id(event: &Value) -> Option<&str> {
         .get("id")
         .or_else(|| event.get("toolCallId"))
         .and_then(Value::as_str)
+}
+
+/// Whether a prompt response signals a local-only completion (`agentInvoked:
+/// false`) — no model turn ran, so no `agent_end`/`turn_end` will follow.
+fn prompt_completed_locally(frame: &Value) -> bool {
+    frame
+        .get("data")
+        .and_then(|data| data.get("agentInvoked"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+/// Parse an OMP `available_commands_update` frame into the agent-neutral
+/// command list the composer renders. Only top-level commands are surfaced;
+/// subcommands and aliases are intentionally skipped for a minimal picker.
+fn parse_available_commands(frame: &Value) -> Vec<acp::AvailableCommand> {
+    let Some(commands) = frame.get("commands").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    commands
+        .iter()
+        .filter_map(parse_available_command)
+        .collect()
+}
+
+fn parse_available_command(command: &Value) -> Option<acp::AvailableCommand> {
+    let name = command.get("name").and_then(Value::as_str)?;
+    let description = command
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut mapped = acp::AvailableCommand::new(name.to_owned(), description.to_owned())
+        .meta(meta_with_command_category(CommandCategory::Native));
+    if let Some(hint) = command
+        .get("input")
+        .and_then(|input| input.get("hint"))
+        .and_then(Value::as_str)
+        .filter(|hint| !hint.is_empty())
+    {
+        mapped = mapped.input(acp::AvailableCommandInput::Unstructured(
+            acp::UnstructuredCommandInput::new(hint.to_owned()),
+        ));
+    }
+    Some(mapped)
 }
 
 #[cfg(all(test, unix))]
@@ -3226,6 +3354,166 @@ mod tests {
             subagent_event_line(&tool_result),
             None,
             "non-assistant messages are skipped"
+        );
+    }
+
+    /// A fake OMP for the slash-command path: it emits an
+    /// `available_commands_update` at startup (before the panel thread attaches,
+    /// exercising the cache-and-flush), and treats any prompt as a local-only
+    /// slash command — emitting `command_output` and acking with
+    /// `data.agentInvoked:false` and no `agent_end`/`turn_end`. No paid omp.
+    struct FakeOmpCommands {
+        dir: tempfile::TempDir,
+        script_path: PathBuf,
+    }
+
+    impl FakeOmpCommands {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let script_path = dir.path().join("fake-omp-commands.sh");
+            fs::write(
+                &script_path,
+                formatdoc! {r#"
+                    #!/bin/sh
+                    while IFS= read -r line; do
+                      case "$line" in
+                        *'"type":"get_state"'*)
+                          id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+                          printf '{{"type":"available_commands_update","commands":[{{"name":"model","description":"Show current model"}},{{"name":"fast","description":"Toggle fast mode","input":{{"hint":"[on|off|status]"}},"source":"builtin"}}]}}\n'
+                          printf '{{"type":"response","id":"%s","success":true,"data":null}}\n' "$id"
+                          ;;
+                        *'"type":"prompt"'*)
+                          id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+                          printf '{{"type":"command_output","text":"Fast mode is off."}}\n'
+                          printf '{{"type":"response","id":"%s","success":true,"data":{{"agentInvoked":false}}}}\n' "$id"
+                          ;;
+                        *'"type":"abort"'*)
+                          printf '{{"type":"response","success":true,"data":null}}\n'
+                          ;;
+                      esac
+                    done
+                "#},
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script_path, permissions).unwrap();
+            Self { dir, script_path }
+        }
+
+        fn command(&self) -> OmpCommand {
+            OmpCommand {
+                program: self.script_path.clone(),
+                prefix_args: Vec::new(),
+            }
+        }
+    }
+
+    async fn start_commands_session(
+        fixture: &FakeOmpCommands,
+        cx: &mut TestAppContext,
+    ) -> gpui::Entity<AcpThread> {
+        let connection = Rc::new(OmpAgentConnection::new(fixture.command()));
+        let project = Project::example([fixture.dir.path()], &mut cx.to_async()).await;
+        cx.update(|cx| {
+            connection
+                .clone()
+                .new_session(project, PathList::new(&[fixture.dir.path()]), cx)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[gpui::test]
+    async fn omp_available_commands_surface_to_thread(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpCommands::new();
+        let thread = start_commands_session(&fixture, cx).await;
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            let names: Vec<String> = thread
+                .available_commands()
+                .iter()
+                .map(|command| command.name.to_string())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["model".to_string(), "fast".to_string()],
+                "startup commands surface to the composer after the thread attaches"
+            );
+            let fast = thread
+                .available_commands()
+                .iter()
+                .find(|command| command.name == "fast")
+                .unwrap();
+            assert!(
+                fast.input.is_some(),
+                "a hinted command keeps its input hint"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn omp_local_slash_command_completes_without_hanging(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpCommands::new();
+        let thread = start_commands_session(&fixture, cx).await;
+
+        // A local-only command acks with agentInvoked:false and no agent_end;
+        // the turn must still complete (awaiting `send` would hang otherwise).
+        let send = thread.update(cx, |thread, cx| thread.send_raw("/fast status", cx));
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                thread.to_markdown(cx).contains("Fast mode is off."),
+                "local command output lands in the transcript"
+            );
+            assert!(
+                !thread.available_commands().is_empty(),
+                "the command list survives the local turn"
+            );
+        });
+    }
+
+    #[test]
+    fn parse_available_commands_maps_names_and_hints() {
+        let frame: Value = serde_json::from_str(
+            r#"{"commands":[{"name":"model","description":"Show model"},{"name":"fast","description":"Toggle","input":{"hint":"[on|off]"}}]}"#,
+        )
+        .unwrap();
+        let commands = parse_available_commands(&frame);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].name.to_string(), "model");
+        assert!(commands[0].input.is_none(), "no hint -> no input");
+        assert_eq!(commands[1].name.to_string(), "fast");
+        assert!(
+            commands[1].input.is_some(),
+            "hint maps to unstructured input"
+        );
+    }
+
+    #[test]
+    fn parse_available_commands_empty_when_missing() {
+        let frame: Value = serde_json::from_str(r#"{"type":"available_commands_update"}"#).unwrap();
+        assert!(
+            parse_available_commands(&frame).is_empty(),
+            "a missing command list degrades to an empty picker"
+        );
+    }
+
+    #[test]
+    fn prompt_completed_locally_detects_agent_invoked_false() {
+        let local: Value = serde_json::from_str(r#"{"data":{"agentInvoked":false}}"#).unwrap();
+        assert!(prompt_completed_locally(&local));
+        let agent: Value = serde_json::from_str(r#"{"data":{"agentInvoked":true}}"#).unwrap();
+        assert!(!prompt_completed_locally(&agent));
+        let null: Value = serde_json::from_str(r#"{"data":null}"#).unwrap();
+        assert!(
+            !prompt_completed_locally(&null),
+            "no signal -> rely on agent_end"
         );
     }
 }
