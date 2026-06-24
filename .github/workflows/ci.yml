@@ -1,0 +1,47 @@
+# DRAFT (AGE-662): pending human enablement of GitHub Actions + any required secrets. Review before enabling.
+#
+# This is a minimal, fork-native PR gate. It is NOT the upstream Zed CI matrix
+# (run_tests.yml / release*.yml) — those jobs are owner-gated to
+# `zed-industries`/`zed-extensions` and no-op on this fork.
+#
+# NOTE TO REVIEWER: do NOT add the upstream owner gate
+#   if: github.repository_owner == 'zed-industries' || ...
+# to this workflow — that gate is exactly why upstream CI runs nothing here.
+# This job is meant to run on THIS fork's pull requests.
+#
+# The durable, enforced pre-merge proof until this is enabled is the local gate
+# documented in docs/src/omp/ci-and-local-gate-policy.md (per changed crate:
+# `cargo test -p <crate>`, `cargo clippy -p <crate> --all-targets -- -D warnings`,
+# and `cargo build -p zed --bin ompzed`).
+
+name: ci-draft
+
+on:
+  pull_request:
+    branches:
+      - main
+
+# Toolchain is pinned by rust-toolchain.toml (channel = "1.95.0", profile = minimal);
+# rustup auto-installs it on the first cargo invocation below.
+
+jobs:
+  build-and-test:
+    name: build + targeted test (draft)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        # `rustup show` reads rust-toolchain.toml and installs the pinned 1.95.0 toolchain.
+        run: rustup show
+
+      - name: Install Linux build dependencies
+        # Zed's build needs system libs; the repo script installs them.
+        run: ./script/linux
+
+      - name: Build the ompzed binary
+        run: cargo build -p zed --bin ompzed
+
+      - name: Run a small targeted test
+        run: cargo test -p util
