@@ -5,9 +5,10 @@ use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use futures::{
-    AsyncBufReadExt as _, AsyncWriteExt as _, StreamExt as _, channel::oneshot, io::BufReader,
+    AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _, channel::oneshot,
+    io::BufReader,
 };
-use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Task};
+use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task};
 use project::{AgentId, Project};
 use serde_json::{Value, json};
 use std::{
@@ -16,6 +17,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     rc::{Rc, Weak},
+    time::Duration,
 };
 use ui::IconName;
 use util::ResultExt as _;
@@ -41,8 +43,10 @@ impl AgentServer for OmpAgentServer {
         cx: &mut App,
     ) -> Task<Result<Rc<dyn AgentConnection>>> {
         let command = OmpCommand::default();
-        cx.spawn(async move |_| {
-            Ok(Rc::new(OmpAgentConnection::new(command)) as Rc<dyn AgentConnection>)
+        cx.spawn(async move |cx| {
+            let connection = Rc::new(OmpAgentConnection::new(command));
+            cx.update(|cx| connection.register_app_quit(cx));
+            Ok(connection as Rc<dyn AgentConnection>)
         })
     }
 
@@ -108,6 +112,7 @@ pub struct OmpAgentConnection {
     command: OmpCommand,
     sessions: RefCell<HashMap<acp::SessionId, OmpSession>>,
     next_session_id: Cell<u64>,
+    quit_subscription: RefCell<Option<Subscription>>,
 }
 
 impl OmpAgentConnection {
@@ -116,48 +121,107 @@ impl OmpAgentConnection {
             command,
             sessions: RefCell::default(),
             next_session_id: Cell::new(0),
+            quit_subscription: RefCell::default(),
         }
     }
 
-    fn next_session_id(&self) -> acp::SessionId {
+    /// Kill every live OMP child when the app is about to quit so that no
+    /// app-owned child outlives Zed.
+    fn register_app_quit(self: &Rc<Self>, cx: &mut App) {
+        let connection = Rc::downgrade(self);
+        let subscription = cx.on_app_quit(move |cx| {
+            if let Some(connection) = connection.upgrade() {
+                connection.dispose_all(cx);
+            }
+            async {}
+        });
+        self.quit_subscription.borrow_mut().replace(subscription);
+    }
+
+    /// Tear down every session, killing its child. Used only on shutdown;
+    /// closing a single session goes through `close_session` and never
+    /// touches its siblings.
+    fn dispose_all(&self, cx: &mut App) {
+        for (_, session) in self.sessions.borrow_mut().drain() {
+            session.state.cancel_active_turn();
+            session.state.reject_pending_requests("OMP agent shutting down");
+            session.state.kill(cx);
+        }
+    }
+
+    /// Fallback id for the rare case where OMP never reports a session
+    /// identity: the session works for the current run but cannot be resumed.
+    fn synthesized_session_id(&self) -> acp::SessionId {
         let id = self.next_session_id.get();
         self.next_session_id.set(id + 1);
         acp::SessionId::new(format!("omp-{id}"))
     }
 
-    fn create_session(
+    /// Spawn a fresh or resumed OMP child, build the thread, and register the
+    /// session.
+    ///
+    /// A fresh session adopts OMP's own reported session id as the persisted
+    /// acp::SessionId, so Zed's existing history store can round-trip a later
+    /// resume without a parallel store. A resume preserves the saved id
+    /// verbatim and asks OMP to replay prior messages, rehydrating the
+    /// transcript without mixing it with any other session.
+    fn open_session(
         self: &Rc<Self>,
-        session_id: acp::SessionId,
+        resume: Option<acp::SessionId>,
         project: Entity<Project>,
         work_dirs: PathList,
+        title: Option<SharedString>,
         cx: &mut App,
-    ) -> Result<Entity<AcpThread>> {
-        let work_dir = work_dirs
-            .ordered_paths()
-            .next()
-            .cloned()
-            .context("OMP agent requires a workspace directory")?;
-        let state = OmpSessionState::spawn(self.command.clone(), &work_dir, cx)?;
-        let action_log = cx.new(|_| ActionLog::new(project.clone()));
-        let thread: Entity<AcpThread> = cx.new(|cx| {
-            AcpThread::new(
-                None,
-                None,
-                Some(work_dirs),
-                self.clone(),
-                project,
-                action_log,
-                session_id.clone(),
-                watch::Receiver::constant(acp::PromptCapabilities::new()),
-                cx,
-            )
-        });
-        state.set_thread(thread.downgrade());
-        state.request_state_update(cx);
-        self.sessions
-            .borrow_mut()
-            .insert(session_id, OmpSession { state });
-        Ok(thread)
+    ) -> Task<Result<Entity<AcpThread>>> {
+        let Some(work_dir) = work_dirs.ordered_paths().next().cloned() else {
+            return Task::ready(Err(anyhow!("OMP agent requires a workspace directory")));
+        };
+        let command = self.command.clone();
+        let connection = self.clone();
+        cx.spawn(async move |cx| {
+            let resume_id = resume.as_ref().map(|session_id| session_id.0.to_string());
+            let state = cx
+                .update(|cx| OmpSessionState::spawn(command, &work_dir, resume_id.as_deref(), cx))?;
+
+            // Learn OMP's own session identity/provenance. A fresh session
+            // adopts it as the persisted id; a resume keeps the saved id.
+            let descriptor = state.clone().fetch_descriptor(cx).await;
+            let session_id = resume.clone().unwrap_or_else(|| {
+                descriptor
+                    .as_ref()
+                    .and_then(OmpDescriptor::acp_session_id)
+                    .unwrap_or_else(|| connection.synthesized_session_id())
+            });
+
+            let thread = cx.update(|cx| {
+                let action_log = cx.new(|_| ActionLog::new(project.clone()));
+                cx.new(|cx| {
+                    AcpThread::new(
+                        None,
+                        title.clone(),
+                        Some(work_dirs.clone()),
+                        connection.clone(),
+                        project.clone(),
+                        action_log,
+                        session_id.clone(),
+                        watch::Receiver::constant(acp::PromptCapabilities::new()),
+                        cx,
+                    )
+                })
+            });
+            state.set_thread(thread.downgrade());
+            if let Some(descriptor) = descriptor.as_ref() {
+                state.apply_descriptor(descriptor, cx);
+            }
+            connection
+                .sessions
+                .borrow_mut()
+                .insert(session_id, OmpSession { state: state.clone() });
+            if resume.is_some() {
+                state.clone().replay_history(cx).await;
+            }
+            Ok(thread)
+        })
     }
 }
 
@@ -176,8 +240,22 @@ impl AgentConnection for OmpAgentConnection {
         work_dirs: PathList,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
-        let session_id = self.next_session_id();
-        Task::ready(self.create_session(session_id, project, work_dirs, cx))
+        self.open_session(None, project, work_dirs, None, cx)
+    }
+
+    fn supports_load_session(&self) -> bool {
+        true
+    }
+
+    fn load_session(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        title: Option<SharedString>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.open_session(Some(session_id), project, work_dirs, title, cx)
     }
 
     fn supports_close_session(&self) -> bool {
@@ -241,6 +319,26 @@ struct OmpSession {
     state: Rc<OmpSessionState>,
 }
 
+/// OMP's own view of a session, parsed from a `get_state` response.
+///
+/// The `session_id` is OMP's stable session identity (adopted as the
+/// acp::SessionId for a fresh session so resume round-trips through Zed's
+/// history store); `session_file` is the JSONL trace path kept as provenance.
+struct OmpDescriptor {
+    session_id: Option<String>,
+    session_file: Option<String>,
+    title: Option<String>,
+}
+
+impl OmpDescriptor {
+    fn acp_session_id(&self) -> Option<acp::SessionId> {
+        self.session_id
+            .as_deref()
+            .or(self.session_file.as_deref())
+            .map(|id| acp::SessionId::new(id.to_owned()))
+    }
+}
+
 struct OmpSessionState {
     outgoing: async_channel::Sender<Value>,
     child: RefCell<Option<Child>>,
@@ -255,7 +353,12 @@ struct OmpSessionState {
 }
 
 impl OmpSessionState {
-    fn spawn(command: OmpCommand, work_dir: &Path, cx: &mut App) -> Result<Rc<Self>> {
+    fn spawn(
+        command: OmpCommand,
+        work_dir: &Path,
+        resume: Option<&str>,
+        cx: &mut App,
+    ) -> Result<Rc<Self>> {
         let mut cmd = std::process::Command::new(&command.program);
         cmd.args(&command.prefix_args)
             .arg("--mode")
@@ -263,8 +366,11 @@ impl OmpSessionState {
             .arg("--cwd")
             .arg(work_dir)
             .arg("--approval-mode")
-            .arg("always-ask")
-            .current_dir(work_dir);
+            .arg("always-ask");
+        if let Some(resume) = resume {
+            cmd.arg("--resume").arg(resume);
+        }
+        cmd.current_dir(work_dir);
         if let Some(path) = augmented_path() {
             cmd.env("PATH", path);
         }
@@ -362,20 +468,46 @@ impl OmpSessionState {
         .log_err();
     }
 
-    fn request_state_update(self: &Rc<Self>, cx: &mut App) {
-        let Ok(rx) = self.send_request("get_state", json!({ "type": "get_state" })) else {
+    /// Send `get_state` and await OMP's reported session descriptor (id,
+    /// trace-file provenance, and display title), bounded by a timeout so a
+    /// silent child never wedges session creation.
+    async fn fetch_descriptor(self: Rc<Self>, cx: &mut AsyncApp) -> Option<OmpDescriptor> {
+        let rx = self
+            .send_request("get_state", json!({ "type": "get_state" }))
+            .ok()?;
+        let mut rx = rx.fuse();
+        let mut timer = cx
+            .background_executor()
+            .timer(Duration::from_secs(10))
+            .fuse();
+        futures::select_biased! {
+            result = rx => match result {
+                Ok(Ok(state)) => Some(parse_descriptor(&state)),
+                _ => None,
+            },
+            _ = timer => {
+                log::warn!("OMP get_state timed out; session will not be resumable");
+                None
+            }
+        }
+    }
+
+    /// Ask a resumed OMP child to replay its saved transcript and await the
+    /// terminating response. OMP streams the prior `history_message` frames
+    /// before that response, so once it resolves the thread has rehydrated.
+    async fn replay_history(self: Rc<Self>, cx: &mut AsyncApp) {
+        let Ok(rx) = self.send_request("get_history", json!({ "type": "get_history" })) else {
             return;
         };
-        let weak = Rc::downgrade(self);
-        cx.spawn(async move |cx| {
-            let Ok(Ok(state)) = rx.await else {
-                return;
-            };
-            if let Some(state_ref) = weak.upgrade() {
-                state_ref.apply_state_update(state, cx);
-            }
-        })
-        .detach();
+        let mut rx = rx.fuse();
+        let mut timer = cx
+            .background_executor()
+            .timer(Duration::from_secs(10))
+            .fuse();
+        futures::select_biased! {
+            _ = rx => {}
+            _ = timer => log::warn!("OMP get_history (resume replay) timed out"),
+        }
     }
 
     fn send_request(
@@ -422,6 +554,7 @@ impl OmpSessionState {
             Some("tool_execution_end") => self.handle_tool_execution_end(&frame, cx),
             Some("agent_end") => self.complete_prompt(acp::StopReason::EndTurn),
             Some("turn_end") => self.handle_turn_end(&frame),
+            Some("history_message") => self.handle_history_message(&frame, cx),
             Some("extension_ui_request") => self.handle_ui_request(&frame),
             _ => {}
         }
@@ -671,26 +804,27 @@ impl OmpSessionState {
         self.send_frame(response).log_err();
     }
 
-    fn apply_state_update(&self, state: Value, cx: &mut AsyncApp) {
-        let session_name = state
-            .get("sessionName")
+    /// Rehydrate a single prior message replayed by a resumed OMP child. The
+    /// frame routes to the current thread, so any other live session is
+    /// untouched.
+    fn handle_history_message(&self, frame: &Value, cx: &mut AsyncApp) {
+        let Some(text) = frame
+            .get("text")
             .and_then(Value::as_str)
-            .filter(|title| !title.is_empty());
-        let session_file = state
-            .get("sessionFile")
-            .and_then(Value::as_str)
-            .filter(|path| !path.is_empty());
-        let session_id = state
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty());
-        let Some(title) = session_file
-            .map(|file| match session_name {
-                Some(name) => format!("{name} · {file}"),
-                None => format!("OMP · {file}"),
-            })
-            .or_else(|| session_name.map(ToOwned::to_owned))
+            .filter(|text| !text.is_empty())
         else {
+            return;
+        };
+        let chunk = acp::ContentChunk::new(text.to_owned().into());
+        let update = match frame.get("role").and_then(Value::as_str) {
+            Some("user") => acp::SessionUpdate::UserMessageChunk(chunk),
+            _ => acp::SessionUpdate::AgentMessageChunk(chunk),
+        };
+        self.send_session_update(update, cx);
+    }
+
+    fn apply_descriptor(&self, descriptor: &OmpDescriptor, cx: &mut AsyncApp) {
+        let Some(title) = descriptor.title.clone() else {
             return;
         };
         if let Some(thread) = self
@@ -700,7 +834,10 @@ impl OmpSessionState {
             .and_then(|thread| thread.upgrade())
         {
             let mut info = acp::SessionInfoUpdate::new().title(title);
-            let meta = omp_session_meta(session_id, session_file);
+            let meta = omp_session_meta(
+                descriptor.session_id.as_deref(),
+                descriptor.session_file.as_deref(),
+            );
             if !meta.is_empty() {
                 info = info.meta(meta);
             }
@@ -830,6 +967,32 @@ fn omp_session_meta(session_id: Option<&str>, session_file: Option<&str>) -> acp
     meta
 }
 
+fn parse_descriptor(state: &Value) -> OmpDescriptor {
+    let session_name = state
+        .get("sessionName")
+        .and_then(Value::as_str)
+        .filter(|title| !title.is_empty());
+    let session_file = state
+        .get("sessionFile")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty());
+    let session_id = state
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    let title = session_file
+        .map(|file| match session_name {
+            Some(name) => format!("{name} · {file}"),
+            None => format!("OMP · {file}"),
+        })
+        .or_else(|| session_name.map(ToOwned::to_owned));
+    OmpDescriptor {
+        session_id: session_id.map(ToOwned::to_owned),
+        session_file: session_file.map(ToOwned::to_owned),
+        title,
+    }
+}
+
 fn response_error(frame: &Value) -> String {
     frame
         .get("error")
@@ -891,9 +1054,9 @@ mod tests {
             .unwrap();
 
         // Phase 0 — child started; record the session (trace) file path. OMP
-        // reports `sessionFile` via get_state; `apply_state_update` renders it
-        // into the thread title (`{sessionName} · {sessionFile}`) and the
-        // `omp_session_file` session meta.
+        // reports `sessionFile` via get_state; `new_session` adopts the
+        // reported session id and renders the title (`{sessionName} ·
+        // {sessionFile}`) plus the `omp_session_file` session meta.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let title = loop {
             if let Some(title) = thread.read_with(cx, |thread, _| {
@@ -1181,6 +1344,194 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn omp_resume_rehydrates_saved_transcript_without_child_leak(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeResumableOmp::new();
+        let connection = Rc::new(OmpAgentConnection::new(fixture.command()));
+        let project = Project::example([fixture.dir.path()], &mut cx.to_async()).await;
+
+        // Open a saved session the way the agent panel does after a restart:
+        // it hands back the persisted session id + title from the history
+        // store. OMP is spawned with `--resume <id>` and replays its trace.
+        let session_id = acp::SessionId::new("saved-1");
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    session_id.clone(),
+                    project,
+                    PathList::new(&[fixture.dir.path()]),
+                    Some("Saved chat".into()),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, cx| {
+            // The resumed thread keeps its own saved id — never another's.
+            assert_eq!(thread.session_id(), &session_id);
+            let markdown = thread.to_markdown(cx);
+            assert!(
+                markdown.contains("earlier question for saved-1"),
+                "resumed thread should rehydrate the prior user message"
+            );
+            assert!(
+                markdown.contains("earlier answer for saved-1"),
+                "resumed thread should rehydrate the prior assistant message"
+            );
+            // The title carries OMP's trace-file provenance.
+            let title = thread
+                .title()
+                .map(|title| title.to_string())
+                .unwrap_or_default();
+            assert!(
+                title.contains(".jsonl"),
+                "resumed thread should surface the OMP trace-file provenance"
+            );
+        });
+
+        // Closing the resumed session must not leak its child.
+        let pid = fixture.pid_for("saved-1");
+        assert!(process_is_alive(pid));
+        cx.update(|cx| connection.clone().close_session(&session_id, cx))
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_alive(pid) && std::time::Instant::now() < deadline {
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        assert!(
+            !process_is_alive(pid),
+            "resumed OMP child must not leak after close"
+        );
+    }
+
+    #[gpui::test]
+    async fn omp_two_saved_sessions_switch_and_close_independently(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeResumableOmp::new();
+        let connection = Rc::new(OmpAgentConnection::new(fixture.command()));
+        let project = Project::example([fixture.dir.path()], &mut cx.to_async()).await;
+
+        let alpha = acp::SessionId::new("alpha");
+        let beta = acp::SessionId::new("beta");
+        let thread_alpha = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    alpha.clone(),
+                    project.clone(),
+                    PathList::new(&[fixture.dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let thread_beta = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    beta.clone(),
+                    project.clone(),
+                    PathList::new(&[fixture.dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // Each thread rehydrates only its own transcript — no cross-talk.
+        thread_alpha.read_with(cx, |thread, cx| {
+            let markdown = thread.to_markdown(cx);
+            assert!(markdown.contains("earlier answer for alpha"));
+            assert!(!markdown.contains("beta"));
+        });
+        thread_beta.read_with(cx, |thread, cx| {
+            let markdown = thread.to_markdown(cx);
+            assert!(markdown.contains("earlier answer for beta"));
+            assert!(!markdown.contains("alpha"));
+        });
+
+        let pid_alpha = fixture.pid_for("alpha");
+        let pid_beta = fixture.pid_for("beta");
+        assert!(process_is_alive(pid_alpha) && process_is_alive(pid_beta));
+
+        // Closing one session leaves the other's child untouched.
+        cx.update(|cx| connection.clone().close_session(&alpha, cx))
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_alive(pid_alpha) && std::time::Instant::now() < deadline {
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        assert!(
+            !process_is_alive(pid_alpha),
+            "the closed session's child should exit"
+        );
+        assert!(
+            process_is_alive(pid_beta),
+            "closing one OMP session must not kill another active session"
+        );
+
+        // Shutdown disposes the survivor too.
+        cx.update(|cx| connection.dispose_all(cx));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_alive(pid_beta) && std::time::Instant::now() < deadline {
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        assert!(!process_is_alive(pid_beta));
+    }
+
+    #[gpui::test]
+    async fn omp_shutdown_disposes_all_children(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeResumableOmp::new();
+        let connection = Rc::new(OmpAgentConnection::new(fixture.command()));
+        let project = Project::example([fixture.dir.path()], &mut cx.to_async()).await;
+
+        let mut pids = Vec::new();
+        for id in ["s-1", "s-2", "s-3"] {
+            cx.update(|cx| {
+                connection.clone().load_session(
+                    acp::SessionId::new(id),
+                    project.clone(),
+                    PathList::new(&[fixture.dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+            pids.push(fixture.pid_for(id));
+        }
+        cx.run_until_parked();
+        assert!(pids.iter().all(|pid| process_is_alive(*pid)));
+
+        // The app-quit hook runs dispose_all; no OMP child may outlive the app.
+        cx.update(|cx| connection.dispose_all(cx));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pids.iter().any(|pid| process_is_alive(*pid))
+            && std::time::Instant::now() < deadline
+        {
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        assert!(
+            pids.iter().all(|pid| !process_is_alive(*pid)),
+            "no OMP child may survive app shutdown"
+        );
+    }
+
     struct FakeOmp {
         dir: tempfile::TempDir,
         script_path: PathBuf,
@@ -1303,6 +1654,92 @@ mod tests {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "fake OMP did not write pid"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// A FakeOmp variant that understands `--resume <id>`: it reports the
+    /// resumed id as its OMP session id, replays a per-session transcript on
+    /// `get_history`, writes a per-session pid file (so independent children
+    /// can be tracked), and then stays alive blocked on stdin.
+    struct FakeResumableOmp {
+        dir: tempfile::TempDir,
+        script_path: PathBuf,
+    }
+
+    impl FakeResumableOmp {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let script_path = dir.path().join("fake-omp-resume.sh");
+            fs::write(
+                &script_path,
+                formatdoc! {r#"
+                    #!/bin/sh
+                    resume=""
+                    prev=""
+                    for arg in "$@"; do
+                      if [ "$prev" = "--resume" ]; then
+                        resume="$arg"
+                      fi
+                      prev="$arg"
+                    done
+                    if [ -n "$resume" ]; then
+                      sid="$resume"
+                    else
+                      sid="fresh-$$"
+                    fi
+                    printf '%s' "$$" > "{dir}/pid.$sid"
+                    while IFS= read -r line; do
+                      id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+                      case "$line" in
+                        *'"type":"get_state"'*)
+                          printf '{{"type":"response","id":"%s","success":true,"data":{{"sessionId":"%s","sessionName":"Resumed OMP","sessionFile":"{dir}/%s.jsonl"}}}}\n' "$id" "$sid" "$sid"
+                          ;;
+                        *'"type":"get_history"'*)
+                          printf '{{"type":"history_message","role":"user","text":"earlier question for %s"}}\n' "$sid"
+                          printf '{{"type":"history_message","role":"assistant","text":"earlier answer for %s"}}\n' "$sid"
+                          printf '{{"type":"response","id":"%s","success":true,"data":null}}\n' "$id"
+                          ;;
+                        *'"type":"prompt"'*)
+                          printf '{{"type":"response","id":"%s","success":true,"data":null}}\n' "$id"
+                          ;;
+                        *'"type":"abort"'*)
+                          printf '{{"type":"response","id":"%s","success":true,"data":null}}\n' "$id"
+                          ;;
+                      esac
+                    done
+                "#,
+                    dir = dir.path().display(),
+                },
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script_path, permissions).unwrap();
+            Self { dir, script_path }
+        }
+
+        fn command(&self) -> OmpCommand {
+            OmpCommand {
+                program: self.script_path.clone(),
+                prefix_args: Vec::new(),
+            }
+        }
+
+        fn pid_for(&self, session_id: &str) -> i32 {
+            let path = self.dir.path().join(format!("pid.{session_id}"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(pid) = fs::read_to_string(&path)
+                    && let Ok(pid) = pid.parse()
+                {
+                    return pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fake OMP did not write pid for {session_id}"
                 );
                 std::thread::sleep(Duration::from_millis(20));
             }
