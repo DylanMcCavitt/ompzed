@@ -267,14 +267,17 @@ fn register_language_model_providers(
     credentials_provider: Arc<dyn CredentialsProvider>,
     cx: &mut Context<LanguageModelRegistry>,
 ) {
-    registry.register_provider(
-        Arc::new(CloudLanguageModelProvider::new(
-            user_store,
-            client.clone(),
+    // Ompzed: OMP is the primary agent, so the zed.dev cloud LLM provider is not
+    // registered by default — this removes it from the model selector and its
+    // "Sign in to Zed" entry, and avoids advertising Zed's AI billing in an
+    // OMP-native product. Set OMPZED_ENABLE_ZED_CLOUD=1 to restore it. The
+    // provider code is retained for collaboration and that opt-in path.
+    if std::env::var_os("OMPZED_ENABLE_ZED_CLOUD").is_some() {
+        registry.register_provider(
+            Arc::new(CloudLanguageModelProvider::new(user_store, client.clone(), cx)),
             cx,
-        )),
-        cx,
-    );
+        );
+    }
     registry.register_provider(
         Arc::new(AnthropicLanguageModelProvider::new(
             client.http_client(),
