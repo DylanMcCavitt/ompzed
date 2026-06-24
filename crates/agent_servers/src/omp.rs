@@ -1,9 +1,12 @@
 use crate::{AgentServer, AgentServerDelegate};
-use acp_thread::{AcpThread, AgentConnection, UserMessageId, meta_with_tool_name};
+use acp_thread::{
+    AcpThread, AgentConnection, UiRequest, UiRequestKind, UiRequestOption, UiRequestScope,
+    UiResponse, UserMessageId, meta_with_tool_name,
+};
 use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result, anyhow};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use futures::{
     AsyncBufReadExt as _, AsyncWriteExt as _, StreamExt as _, channel::oneshot, io::BufReader,
 };
@@ -192,6 +195,8 @@ impl AgentConnection for OmpAgentConnection {
         if let Some(session) = self.sessions.borrow_mut().remove(session_id) {
             session.state.cancel_active_turn();
             session.state.reject_pending_requests("OMP session closed");
+            session.state.reject_pending_ui_requests();
+            session.state.clear_thread_ui_requests(cx);
             session.state.kill(cx);
         }
         Task::ready(Ok(()))
@@ -224,10 +229,24 @@ impl AgentConnection for OmpAgentConnection {
         }
     }
 
-    fn cancel(&self, session_id: &acp::SessionId, _cx: &mut App) {
-        if let Some(session) = self.sessions.borrow().get(session_id) {
+    fn cancel(&self, session_id: &acp::SessionId, cx: &mut App) {
+        if let Some(session) = self.sessions.borrow().get(session_id).cloned() {
             session.state.send_abort();
             session.state.cancel_active_turn();
+            session.state.reject_pending_ui_requests();
+            session.state.clear_thread_ui_requests(cx);
+        }
+    }
+
+    fn respond_to_ui_request(
+        &self,
+        session_id: &acp::SessionId,
+        request_id: &str,
+        response: UiResponse,
+        _cx: &mut App,
+    ) {
+        if let Some(session) = self.sessions.borrow().get(session_id) {
+            session.state.respond_ui_request(request_id, response);
         }
     }
 
@@ -247,6 +266,10 @@ struct OmpSessionState {
     thread: RefCell<Option<gpui::WeakEntity<AcpThread>>>,
     pending_prompt: RefCell<Option<PendingPrompt>>,
     pending_requests: RefCell<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
+    /// Ids of `extension_ui_request`s surfaced to the panel and not yet
+    /// answered. Removed when answered, or cleared on cancel/exit so a request
+    /// can never be answered twice or after the session is cancelled.
+    pending_ui_requests: RefCell<HashSet<String>>,
     closed: Cell<bool>,
     next_request_id: Cell<u64>,
     _read_task: Task<()>,
@@ -321,6 +344,7 @@ impl OmpSessionState {
                 thread: RefCell::default(),
                 pending_prompt: RefCell::default(),
                 pending_requests: RefCell::default(),
+                pending_ui_requests: RefCell::default(),
                 closed: Cell::new(false),
                 next_request_id: Cell::new(0),
                 _read_task: read_task,
@@ -422,7 +446,7 @@ impl OmpSessionState {
             Some("tool_execution_end") => self.handle_tool_execution_end(&frame, cx),
             Some("agent_end") => self.complete_prompt(acp::StopReason::EndTurn),
             Some("turn_end") => self.handle_turn_end(&frame),
-            Some("extension_ui_request") => self.handle_ui_request(&frame),
+            Some("extension_ui_request") => self.handle_ui_request(&frame, cx),
             _ => {}
         }
     }
@@ -645,30 +669,71 @@ impl OmpSessionState {
         }
     }
 
-    fn handle_ui_request(&self, frame: &Value) {
+    fn handle_ui_request(&self, frame: &Value, cx: &mut AsyncApp) {
         let Some(id) = frame.get("id").and_then(Value::as_str) else {
             return;
         };
         let method = frame.get("method").and_then(Value::as_str);
-        let response = match method {
-            Some("confirm") => json!({
-                "type": "extension_ui_response",
-                "id": id,
-                "confirmed": false,
-            }),
-            Some("select" | "input" | "editor" | "cancel") => json!({
-                "type": "extension_ui_response",
-                "id": id,
-                "cancelled": true,
-            }),
-            _ => return,
+        let Some(kind) = method.and_then(ui_request_kind) else {
+            // Unknown or explicit-cancel methods fail closed immediately so the
+            // runtime is never left waiting on a request the panel can't show.
+            self.send_frame(fail_closed_ui_response(id, None)).log_err();
+            return;
         };
-        log::warn!(
-            "default-denying OMP UI request `{}` ({})",
-            method.unwrap_or("unknown"),
-            id
-        );
-        self.send_frame(response).log_err();
+
+        let request = normalize_ui_request(id.to_owned(), kind, frame);
+
+        let Some(thread) = self
+            .thread
+            .borrow()
+            .as_ref()
+            .and_then(|thread| thread.upgrade())
+        else {
+            // No panel is attached to surface the request: fail closed rather
+            // than hang the runtime waiting for an answer that can't arrive.
+            self.send_frame(fail_closed_ui_response(id, Some(kind)))
+                .log_err();
+            return;
+        };
+
+        self.pending_ui_requests.borrow_mut().insert(id.to_owned());
+        thread.update(cx, |thread, cx| thread.push_ui_request(request, cx));
+    }
+
+    /// Routes the user's answer to a surfaced UI request back to OMP, keyed by
+    /// request id. The pending-id check makes this answer-once: a second answer,
+    /// or any answer after the session was cancelled/closed (which clears the
+    /// pending set), is dropped without sending a frame.
+    fn respond_ui_request(&self, request_id: &str, response: UiResponse) {
+        if !self.pending_ui_requests.borrow_mut().remove(request_id) {
+            return;
+        }
+        let payload = match response {
+            UiResponse::Approve => json!({ "confirmed": true }),
+            UiResponse::Deny => json!({ "confirmed": false }),
+            UiResponse::Cancel => json!({ "cancelled": true }),
+            UiResponse::Input(value) => json!({ "value": value }),
+            UiResponse::Select(option_id) => json!({ "selected": option_id.to_string() }),
+        };
+        self.send_frame(ui_response_frame(request_id, payload))
+            .log_err();
+    }
+
+    /// Drops every outstanding UI request so a late answer can no longer reach
+    /// OMP. Used on turn cancel, session close, and child exit.
+    fn reject_pending_ui_requests(&self) {
+        self.pending_ui_requests.borrow_mut().clear();
+    }
+
+    fn clear_thread_ui_requests(&self, cx: &mut App) {
+        if let Some(thread) = self
+            .thread
+            .borrow()
+            .as_ref()
+            .and_then(|thread| thread.upgrade())
+        {
+            thread.update(cx, |thread, cx| thread.clear_ui_requests(cx));
+        }
     }
 
     fn apply_state_update(&self, state: Value, cx: &mut AsyncApp) {
@@ -726,6 +791,15 @@ impl OmpSessionState {
         self.outgoing.close();
         self.complete_prompt(acp::StopReason::Cancelled);
         self.reject_pending_requests("OMP child exited");
+        self.reject_pending_ui_requests();
+        if let Some(thread) = self
+            .thread
+            .borrow()
+            .as_ref()
+            .and_then(|thread| thread.upgrade())
+        {
+            thread.update(cx, |thread, cx| thread.clear_ui_requests(cx));
+        }
         if let Some(mut child) = self.child.borrow_mut().take() {
             cx.background_spawn(async move {
                 child.status().await.log_err();
@@ -836,6 +910,105 @@ fn response_error(frame: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("OMP request failed")
         .to_owned()
+}
+
+/// Maps an OMP `extension_ui_request` method name to its normalized kind.
+/// Unknown methods (and the runtime's own `cancel`) return `None` so the bridge
+/// fails them closed rather than surfacing a widget it can't answer.
+fn ui_request_kind(method: &str) -> Option<UiRequestKind> {
+    match method {
+        "confirm" => Some(UiRequestKind::Approval),
+        "input" => Some(UiRequestKind::Input),
+        "select" => Some(UiRequestKind::Select),
+        "editor" => Some(UiRequestKind::Editor),
+        "open_url" | "openUrl" | "open-url" => Some(UiRequestKind::OpenUrl),
+        _ => None,
+    }
+}
+
+/// Normalizes an OMP `extension_ui_request` frame into the agent-neutral
+/// [`UiRequest`] the panel renders. Field names are probed defensively so the
+/// bridge tolerates protocol naming variants.
+fn normalize_ui_request(id: String, kind: UiRequestKind, frame: &Value) -> UiRequest {
+    let message = first_str(frame, &["message", "prompt", "title", "question"])
+        .unwrap_or_default()
+        .to_owned()
+        .into();
+    let scope = UiRequestScope {
+        tool: first_shared(frame, &["tool", "toolName"]),
+        action: first_shared(frame, &["action"]),
+        path: first_shared(frame, &["path", "filePath", "file"]),
+        workspace: first_shared(frame, &["workspace", "cwd", "workspaceRoot"]),
+        session: first_shared(frame, &["sessionId", "session"]),
+    };
+    UiRequest {
+        id: id.into(),
+        kind,
+        message,
+        scope,
+        options: parse_ui_options(frame),
+        default_value: first_shared(frame, &["defaultValue", "value", "content", "default"]),
+        url: first_shared(frame, &["url", "href", "link"]),
+    }
+}
+
+fn parse_ui_options(frame: &Value) -> Vec<UiRequestOption> {
+    let Some(options) = frame.get("options").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    options
+        .iter()
+        .filter_map(|option| match option {
+            Value::String(value) if !value.is_empty() => Some(UiRequestOption {
+                id: value.clone().into(),
+                label: value.clone().into(),
+            }),
+            Value::Object(_) => {
+                let id = first_str(option, &["value", "id", "key"])?;
+                let label = first_str(option, &["label", "name", "title"]).unwrap_or(id);
+                Some(UiRequestOption {
+                    id: id.to_owned().into(),
+                    label: label.to_owned().into(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .filter(|found| !found.is_empty())
+}
+
+fn first_shared(value: &Value, keys: &[&str]) -> Option<SharedString> {
+    first_str(value, keys).map(|found| found.to_owned().into())
+}
+
+/// Builds the deny/cancel response sent when a request can't be surfaced (no
+/// panel) or isn't answerable (unknown method): approvals/open-url deny,
+/// everything else cancels.
+fn fail_closed_ui_response(id: &str, kind: Option<UiRequestKind>) -> Value {
+    let payload = match kind {
+        Some(UiRequestKind::Approval | UiRequestKind::OpenUrl) => json!({ "confirmed": false }),
+        _ => json!({ "cancelled": true }),
+    };
+    ui_response_frame(id, payload)
+}
+
+/// Wraps a response payload in the `extension_ui_response` envelope keyed by id.
+fn ui_response_frame(id: &str, payload: Value) -> Value {
+    let mut frame = json!({
+        "type": "extension_ui_response",
+        "id": id,
+    });
+    if let Value::Object(fields) = payload {
+        for (key, value) in fields {
+            frame[key] = value;
+        }
+    }
+    frame
 }
 
 #[cfg(all(test, unix))]
@@ -1035,14 +1208,19 @@ mod tests {
             .await
             .unwrap();
 
-        thread
-            .update(cx, |thread, cx| thread.send_raw("needs approval", cx))
-            .await
-            .unwrap();
+        // A response-required UI request now surfaces to the panel and waits for
+        // the user instead of auto-denying. Acting as the panel, deny it: the
+        // turn must fail closed (confirmed:false) and end Idle without hanging.
+        let send = thread.update(cx, |thread, cx| thread.send_raw("needs approval", cx));
+        let id = wait_for_ui_requests(&thread, 1, cx).await.remove(0);
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(id, UiResponse::Deny, cx)
+        });
+        send.await.unwrap();
         cx.run_until_parked();
 
         let seen_response = fs::read_to_string(&fixture.ui_response_path)
-            .expect("fake OMP should record fail-closed response");
+            .expect("fake OMP should record the deny response");
         assert!(seen_response.contains("\"type\":\"extension_ui_response\""));
         assert!(seen_response.contains("\"confirmed\":false"));
         thread.read_with(cx, |thread, _| {
@@ -1311,5 +1489,353 @@ mod tests {
 
     fn process_is_alive(pid: i32) -> bool {
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Deterministic fake OMP that drives the `extension_ui_request` roundtrip:
+    /// it surfaces a request per `mode`, records every `extension_ui_response`
+    /// it receives (appended, so double-answers are observable), and only
+    /// "performs the action" (touches `mutation_path`) when an approval comes
+    /// back `confirmed:true`. No network, no paid omp.
+    struct FakeOmpUi {
+        dir: tempfile::TempDir,
+        script_path: PathBuf,
+        responses_path: PathBuf,
+        mutation_path: PathBuf,
+    }
+
+    impl FakeOmpUi {
+        fn new(mode: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let script_path = dir.path().join("fake-omp-ui.sh");
+            let pid_path = dir.path().join("pid");
+            let responses_path = dir.path().join("ui-responses");
+            let mutation_path = dir.path().join("mutation");
+            fs::write(
+                &script_path,
+                formatdoc! {r#"
+                    #!/bin/sh
+                    printf '%s' "$$" > "{pid_path}"
+                    while IFS= read -r line; do
+                      case "$line" in
+                        *'"type":"get_state"'*)
+                          id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+                          printf '{{"type":"response","id":"%s","success":true,"data":null}}\n' "$id"
+                          ;;
+                        *'"type":"prompt"'*)
+                          id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+                          printf '{{"type":"response","id":"%s","success":true,"data":null}}\n' "$id"
+                          case "{mode}" in
+                            confirm)
+                              printf '{{"type":"extension_ui_request","id":"ui-1","method":"confirm","message":"Write file?","tool":"write","path":"out.txt"}}\n'
+                              ;;
+                            input)
+                              printf '{{"type":"extension_ui_request","id":"ui-1","method":"input","message":"Your name?","defaultValue":""}}\n'
+                              ;;
+                            select)
+                              printf '{{"type":"extension_ui_request","id":"ui-1","method":"select","message":"Pick one","options":[{{"value":"a","label":"Option A"}},{{"value":"b","label":"Option B"}}]}}\n'
+                              ;;
+                            queue)
+                              printf '{{"type":"extension_ui_request","id":"ui-1","method":"confirm","message":"First?","tool":"write","path":"a.txt"}}\n'
+                              printf '{{"type":"extension_ui_request","id":"ui-2","method":"confirm","message":"Second?","tool":"write","path":"b.txt"}}\n'
+                              ;;
+                          esac
+                          ;;
+                        *'"type":"extension_ui_response"'*)
+                          printf '%s\n' "$line" >> "{responses_path}"
+                          delta="ack"
+                          case "{mode}" in
+                            input)
+                              value=$(printf '%s\n' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+                              delta="input:$value"
+                              ;;
+                            select)
+                              sel=$(printf '%s\n' "$line" | sed -n 's/.*"selected":"\([^"]*\)".*/\1/p')
+                              delta="selected:$sel"
+                              ;;
+                            *)
+                              case "$line" in
+                                *'"confirmed":true'*)
+                                  touch "{mutation_path}"
+                                  delta="result:approved"
+                                  ;;
+                                *)
+                                  delta="result:denied"
+                                  ;;
+                              esac
+                              ;;
+                          esac
+                          printf '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta","delta":"%s"}}}}\n' "$delta"
+                          case "{mode}" in
+                            queue) ;;
+                            *) printf '{{"type":"turn_end","message":{{"stopReason":"endTurn"}}}}\n' ;;
+                          esac
+                          ;;
+                        *'"type":"abort"'*)
+                          printf '{{"type":"response","success":true,"data":null}}\n'
+                          ;;
+                      esac
+                    done
+                "#,
+                    pid_path = pid_path.display(),
+                    responses_path = responses_path.display(),
+                    mutation_path = mutation_path.display(),
+                    mode = mode,
+                },
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script_path, permissions).unwrap();
+            Self {
+                dir,
+                script_path,
+                responses_path,
+                mutation_path,
+            }
+        }
+
+        fn command(&self) -> OmpCommand {
+            OmpCommand {
+                program: self.script_path.clone(),
+                prefix_args: Vec::new(),
+            }
+        }
+
+        fn responses(&self) -> String {
+            fs::read_to_string(&self.responses_path).unwrap_or_default()
+        }
+    }
+
+    async fn start_ui_session(
+        fixture: &FakeOmpUi,
+        cx: &mut TestAppContext,
+    ) -> (Rc<OmpAgentConnection>, gpui::Entity<AcpThread>) {
+        let connection = Rc::new(OmpAgentConnection::new(fixture.command()));
+        let project = Project::example([fixture.dir.path()], &mut cx.to_async()).await;
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[fixture.dir.path()]), cx)
+            })
+            .await
+            .unwrap();
+        (connection, thread)
+    }
+
+    async fn wait_for_ui_requests(
+        thread: &gpui::Entity<AcpThread>,
+        count: usize,
+        cx: &mut TestAppContext,
+    ) -> Vec<SharedString> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let ids = thread.read_with(cx, |thread, _| {
+                thread
+                    .ui_requests()
+                    .iter()
+                    .map(|request| request.id.clone())
+                    .collect::<Vec<_>>()
+            });
+            if ids.len() >= count {
+                return ids;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected {count} OMP UI request(s) to surface"
+            );
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+    }
+
+    #[gpui::test]
+    async fn omp_ui_approve_sends_confirmed_true_and_runs_action(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpUi::new("confirm");
+        let (_connection, thread) = start_ui_session(&fixture, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("write please", cx));
+        let id = wait_for_ui_requests(&thread, 1, cx).await.remove(0);
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(id, UiResponse::Approve, cx)
+        });
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            fixture.responses().contains("\"confirmed\":true"),
+            "approve must send the exact positive response, got: {}",
+            fixture.responses()
+        );
+        assert!(
+            fixture.mutation_path.exists(),
+            "approved action should have run"
+        );
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.to_markdown(cx).contains("result:approved"));
+            assert!(thread.ui_requests().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn omp_ui_deny_blocks_action_without_mutation(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpUi::new("confirm");
+        let (_connection, thread) = start_ui_session(&fixture, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("write please", cx));
+        let id = wait_for_ui_requests(&thread, 1, cx).await.remove(0);
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(id, UiResponse::Deny, cx)
+        });
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        assert!(fixture.responses().contains("\"confirmed\":false"));
+        assert!(
+            !fixture.mutation_path.exists(),
+            "denied action must leave the project unchanged"
+        );
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.to_markdown(cx).contains("result:denied"));
+        });
+    }
+
+    #[gpui::test]
+    async fn omp_ui_input_roundtrips_into_transcript(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpUi::new("input");
+        let (_connection, thread) = start_ui_session(&fixture, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("ask name", cx));
+        let id = wait_for_ui_requests(&thread, 1, cx).await.remove(0);
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(id, UiResponse::Input("Ada Lovelace".to_owned()), cx)
+        });
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        assert!(fixture.responses().contains("\"value\":\"Ada Lovelace\""));
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.to_markdown(cx).contains("Ada Lovelace"));
+        });
+    }
+
+    #[gpui::test]
+    async fn omp_ui_select_roundtrips_into_transcript(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpUi::new("select");
+        let (_connection, thread) = start_ui_session(&fixture, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("pick", cx));
+        let id = wait_for_ui_requests(&thread, 1, cx).await.remove(0);
+        thread.read_with(cx, |thread, _| {
+            let options = &thread.ui_requests()[0].options;
+            assert_eq!(options.len(), 2);
+            assert_eq!(options[0].id.as_ref(), "a");
+            assert_eq!(options[1].id.as_ref(), "b");
+        });
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(id, UiResponse::Select("b".into()), cx)
+        });
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        assert!(fixture.responses().contains("\"selected\":\"b\""));
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.to_markdown(cx).contains("selected:b"));
+        });
+    }
+
+    #[gpui::test]
+    async fn omp_ui_request_cannot_be_answered_twice(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpUi::new("confirm");
+        let (_connection, thread) = start_ui_session(&fixture, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("write please", cx));
+        let id = wait_for_ui_requests(&thread, 1, cx).await.remove(0);
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(id.clone(), UiResponse::Approve, cx)
+        });
+        send.await.unwrap();
+        cx.run_until_parked();
+        // A second answer for the same id must be dropped.
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(id, UiResponse::Deny, cx)
+        });
+        cx.run_until_parked();
+
+        let response_lines = fixture.responses().lines().count();
+        assert_eq!(response_lines, 1, "a request must be answered exactly once");
+    }
+
+    #[gpui::test]
+    async fn omp_ui_request_rejected_after_cancellation(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpUi::new("confirm");
+        let (connection, thread) = start_ui_session(&fixture, cx).await;
+
+        let send = thread.update(cx, |thread, cx| thread.send_raw("write please", cx));
+        let id = wait_for_ui_requests(&thread, 1, cx).await.remove(0);
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        cx.update(|cx| connection.cancel(&session_id, cx));
+        send.await.unwrap();
+        cx.run_until_parked();
+        // The request was cleared on cancellation; a late answer is a no-op.
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(id, UiResponse::Approve, cx)
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !fixture.responses().contains("\"confirmed\":true"),
+            "no answer may reach OMP after cancellation"
+        );
+        assert!(!fixture.mutation_path.exists());
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.ui_requests().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn omp_ui_requests_queue_in_arrival_order(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmpUi::new("queue");
+        let (connection, thread) = start_ui_session(&fixture, cx).await;
+
+        let _send = thread.update(cx, |thread, cx| thread.send_raw("two asks", cx));
+        let ids = wait_for_ui_requests(&thread, 2, cx).await;
+        assert_eq!(ids[0].as_ref(), "ui-1");
+        assert_eq!(ids[1].as_ref(), "ui-2");
+
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(ids[0].clone(), UiResponse::Approve, cx)
+        });
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_ui_request(ids[1].clone(), UiResponse::Deny, cx)
+        });
+        cx.run_until_parked();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while fixture.responses().lines().count() < 2 && std::time::Instant::now() < deadline {
+            cx.background_executor
+                .timer(Duration::from_millis(20))
+                .await;
+            cx.run_until_parked();
+        }
+
+        let responses = fixture.responses();
+        let lines: Vec<&str> = responses.lines().collect();
+        assert_eq!(lines.len(), 2, "both queued requests should be answered");
+        assert!(lines[0].contains("\"id\":\"ui-1\"") && lines[0].contains("\"confirmed\":true"));
+        assert!(lines[1].contains("\"id\":\"ui-2\"") && lines[1].contains("\"confirmed\":false"));
+
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        cx.update(|cx| connection.clone().close_session(&session_id, cx))
+            .await
+            .unwrap();
     }
 }
