@@ -570,6 +570,9 @@ pub struct ThreadView {
     pub profile_selector: Option<Entity<ProfileSelector>>,
     pub permission_dropdown_handle: PopoverMenuHandle<ContextMenu>,
     pub thread_retry_status: Option<RetryStatus>,
+    /// The prompt view for the head of the thread's pending UI-request queue,
+    /// rebuilt when the head request id changes.
+    ui_request_prompt: Option<Entity<crate::ui_request_prompt::UiRequestPrompt>>,
     pub(super) thread_error: Option<ThreadError>,
     pub thread_error_markdown: Option<Entity<Markdown>>,
     pub token_limit_callout_dismissed: bool,
@@ -953,6 +956,7 @@ impl ThreadView {
             _subscriptions: subscriptions,
             permission_dropdown_handle: PopoverMenuHandle::default(),
             thread_retry_status: None,
+            ui_request_prompt: None,
             thread_error: None,
             thread_error_markdown: None,
             token_limit_callout_dismissed: false,
@@ -2808,6 +2812,35 @@ impl ThreadView {
                 .title(state.last_error.clone())
                 .description(retry_message),
         )
+    }
+
+    /// Reconciles and renders the prompt for the head of the thread's pending
+    /// UI-request queue (approval / input / select / editor / open-url). The
+    /// prompt view is rebuilt only when the head request id changes, so an
+    /// in-progress input editor keeps its state across re-renders.
+    fn render_ui_request_prompt(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let head = self.thread.read(cx).ui_requests().first().cloned();
+        let Some(head) = head else {
+            self.ui_request_prompt = None;
+            return None;
+        };
+        let matches_head = self
+            .ui_request_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.read(cx).request_id() == head.id);
+        if !matches_head {
+            let thread = self.thread.clone();
+            self.ui_request_prompt = Some(cx.new(|cx| {
+                crate::ui_request_prompt::UiRequestPrompt::new(thread, head, window, cx)
+            }));
+        }
+        self.ui_request_prompt
+            .clone()
+            .map(|prompt| prompt.into_any_element())
     }
 
     fn activity_bar_bg(&self, cx: &Context<Self>) -> Hsla {
@@ -11324,6 +11357,7 @@ impl Render for ThreadView {
                 |this, version| this.child(self.render_new_version_callout(&version, cx)),
             )
             .children(self.render_token_limit_callout(cx))
+            .children(self.render_ui_request_prompt(window, cx))
             .child(self.render_message_editor(window, cx))
     }
 }

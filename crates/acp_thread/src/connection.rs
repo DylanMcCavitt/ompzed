@@ -87,6 +87,80 @@ pub fn build_terminal_auth_task(
     }
 }
 
+/// Agent-neutral kind of an interactive request a runtime surfaces to the agent
+/// panel. `OpenUrl` is always rendered as an explicit action the user must
+/// confirm; it is never auto-navigated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiRequestKind {
+    Approval,
+    Input,
+    Select,
+    Editor,
+    OpenUrl,
+}
+
+/// Visible scope shown alongside a [`UiRequest`] so the user can judge exactly
+/// what they are approving. Every field is optional; runtimes populate what
+/// they know about the pending action.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UiRequestScope {
+    pub tool: Option<SharedString>,
+    pub action: Option<SharedString>,
+    pub path: Option<SharedString>,
+    pub workspace: Option<SharedString>,
+    pub session: Option<SharedString>,
+}
+
+impl UiRequestScope {
+    pub fn is_empty(&self) -> bool {
+        self.tool.is_none()
+            && self.action.is_none()
+            && self.path.is_none()
+            && self.workspace.is_none()
+            && self.session.is_none()
+    }
+}
+
+/// One selectable choice in a [`UiRequestKind::Select`] request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiRequestOption {
+    pub id: SharedString,
+    pub label: SharedString,
+}
+
+/// A normalized interactive request surfaced from a runtime to the agent panel,
+/// answered exactly once via [`AcpThread::respond_to_ui_request`] and routed
+/// back to the runtime by [`UiRequest::id`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiRequest {
+    /// Runtime-assigned request id. The response is keyed by this value.
+    pub id: SharedString,
+    pub kind: UiRequestKind,
+    pub message: SharedString,
+    pub scope: UiRequestScope,
+    /// Choices for [`UiRequestKind::Select`]; empty for other kinds.
+    pub options: Vec<UiRequestOption>,
+    /// Prefilled value for [`UiRequestKind::Input`]/[`UiRequestKind::Editor`].
+    pub default_value: Option<SharedString>,
+    /// Target for [`UiRequestKind::OpenUrl`], rendered as an explicit action.
+    pub url: Option<SharedString>,
+}
+
+/// The user's answer to a [`UiRequest`], routed to the runtime by request id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UiResponse {
+    /// Positive answer for an approval or open-url request.
+    Approve,
+    /// Explicit negative answer for an approval or open-url request.
+    Deny,
+    /// Dismissal of an input/select/editor request (also the default for Esc).
+    Cancel,
+    /// Captured text for an input or editor request.
+    Input(String),
+    /// The chosen option id for a select request.
+    Select(SharedString),
+}
+
 pub trait AgentConnection {
     fn agent_id(&self) -> AgentId;
 
@@ -242,6 +316,18 @@ pub trait AgentConnection {
 
     fn session_list(&self, _cx: &mut App) -> Option<Rc<dyn AgentSessionList>> {
         None
+    }
+
+    /// Routes a user's answer to a [`UiRequest`] back to the runtime, keyed by
+    /// request id. The default implementation is a no-op for connections that
+    /// never surface UI requests.
+    fn respond_to_ui_request(
+        &self,
+        _session_id: &acp::SessionId,
+        _request_id: &str,
+        _response: UiResponse,
+        _cx: &mut App,
+    ) {
     }
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
@@ -745,6 +831,7 @@ mod test_support {
         supports_session_additional_directories: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
+        ui_responses: Arc<Mutex<Vec<(String, UiResponse)>>>,
     }
 
     struct Session {
@@ -768,7 +855,14 @@ mod test_support {
                 supports_session_additional_directories: false,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
+                ui_responses: Arc::default(),
             }
+        }
+
+        /// Returns the UI request responses this stub has been asked to route,
+        /// in order, as `(request_id, response)` pairs.
+        pub fn ui_responses(&self) -> Vec<(String, UiResponse)> {
+            self.ui_responses.lock().clone()
         }
 
         pub fn set_next_prompt_updates(&self, updates: Vec<acp::SessionUpdate>) {
@@ -1027,6 +1121,18 @@ mod test_support {
             _cx: &App,
         ) -> Option<Rc<dyn AgentSessionTruncate>> {
             Some(Rc::new(StubAgentSessionEditor))
+        }
+
+        fn respond_to_ui_request(
+            &self,
+            _session_id: &acp::SessionId,
+            request_id: &str,
+            response: UiResponse,
+            _cx: &mut App,
+        ) {
+            self.ui_responses
+                .lock()
+                .push((request_id.to_owned(), response));
         }
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {

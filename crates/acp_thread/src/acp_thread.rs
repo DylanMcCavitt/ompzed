@@ -1533,6 +1533,10 @@ pub struct AcpThread {
     /// gradually to create a fluid typing effect instead of choppy chunk-at-a-time
     /// updates.
     streaming_text_buffer: Option<StreamingTextBuffer>,
+    /// Pending interactive requests surfaced by the runtime (approval, input,
+    /// select, editor, open-url), in arrival order. The panel renders the head
+    /// first; each is answered exactly once via [`Self::respond_to_ui_request`].
+    ui_requests: Vec<UiRequest>,
 }
 
 struct StreamingTextBuffer {
@@ -1736,7 +1740,55 @@ impl AcpThread {
             draft_prompt: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
+            ui_requests: Vec::new(),
         }
+    }
+
+    /// Pending interactive UI requests surfaced by the runtime, in arrival
+    /// order. The head is the next request the panel should foreground.
+    pub fn ui_requests(&self) -> &[UiRequest] {
+        &self.ui_requests
+    }
+
+    /// Surface a new interactive UI request for the user to answer. Appended to
+    /// the pending queue so requests are presented in arrival order.
+    pub fn push_ui_request(&mut self, request: UiRequest, cx: &mut Context<Self>) {
+        self.ui_requests.push(request);
+        cx.notify();
+    }
+
+    /// Answer a pending UI request exactly once, routing the response to the
+    /// runtime by id. A second answer — or any answer after the request was
+    /// cleared by [`Self::clear_ui_requests`] (session cancellation) — is a
+    /// no-op, so a request can never be answered twice or after cancellation.
+    pub fn respond_to_ui_request(
+        &mut self,
+        request_id: SharedString,
+        response: UiResponse,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .ui_requests
+            .iter()
+            .position(|request| request.id == request_id)
+        else {
+            return;
+        };
+        self.ui_requests.remove(index);
+        self.connection
+            .respond_to_ui_request(&self.session_id, &request_id, response, cx);
+        cx.notify();
+    }
+
+    /// Drop all pending UI requests without answering them. Called when the
+    /// session is cancelled or closed; the runtime is responsible for not
+    /// acting on the now-unanswerable requests.
+    pub fn clear_ui_requests(&mut self, cx: &mut Context<Self>) {
+        if self.ui_requests.is_empty() {
+            return;
+        }
+        self.ui_requests.clear();
+        cx.notify();
     }
 
     pub fn parent_session_id(&self) -> Option<&acp::SessionId> {
