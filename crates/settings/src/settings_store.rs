@@ -1831,7 +1831,8 @@ mod tests {
 
         assert_eq!(
             store.get::<AutoUpdateSetting>(None),
-            &AutoUpdateSetting { auto_update: true }
+            // Ompzed defaults auto_update off (no upstream release server).
+            &AutoUpdateSetting { auto_update: false }
         );
         assert_eq!(
             store.get::<ItemSettings>(None).close_position,
