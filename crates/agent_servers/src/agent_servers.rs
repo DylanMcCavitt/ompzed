@@ -10,7 +10,9 @@ use collections::{HashMap, HashSet};
 pub use custom::*;
 use fs::Fs;
 use http_client::read_no_proxy_from_env;
-pub use omp::{OMP_AGENT_ID, OmpAgentConnection, OmpAgentServer};
+pub use omp::{
+    OMP_AGENT_ID, OmpAgentConnection, OmpAgentServer, OmpDiscovery, OmpSettings, discover_omp,
+};
 use project::{AgentId, Project, agent_server_store::AgentServerStore};
 
 use acp_thread::AgentConnection;

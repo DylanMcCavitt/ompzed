@@ -146,6 +146,9 @@ pub struct SettingsContent {
     pub agent: Option<AgentSettingsContent>,
     pub agent_servers: Option<AllAgentServersSettings>,
 
+    /// Workspace-scoped configuration for the built-in OMP agent.
+    pub omp: Option<OmpSettingsContent>,
+
     /// Configuration of audio in Zed.
     pub audio: Option<AudioSettingsContent>,
 
