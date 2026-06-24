@@ -426,7 +426,18 @@ impl OmpSessionState {
             cmd.env("PATH", path);
         }
 
-        let mut child = Child::spawn(cmd, Stdio::piped(), Stdio::piped(), Stdio::piped())?;
+        // Surface a clear, user-facing status when the agent can't start (most
+        // often a missing binary). This error propagates up through
+        // `new_session` and is rendered by the agent panel's "Failed to Launch"
+        // surface, so a missing OMP degrades visibly instead of with a cryptic
+        // OS error.
+        let mut child = Child::spawn(cmd, Stdio::piped(), Stdio::piped(), Stdio::piped())
+            .with_context(|| {
+                format!(
+                    "Could not start the OMP agent ({}). Install omp or set `omp.binary_path` in settings.",
+                    command.program.display()
+                )
+            })?;
         let stdin = child.stdin.take().context("failed to take OMP stdin")?;
         let stdout = child.stdout.take().context("failed to take OMP stdout")?;
         let stderr = child.stderr.take().context("failed to take OMP stderr")?;
@@ -1415,6 +1426,36 @@ mod tests {
         );
         // The second session in workspace B did not disturb workspace A's cwd.
         assert_ne!(marker_a, marker_b);
+    }
+
+    #[gpui::test]
+    async fn omp_missing_binary_yields_visible_launch_error(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let missing = workspace.path().join("definitely-not-omp");
+        let command = OmpCommand {
+            program: missing,
+            prefix_args: Vec::new(),
+        };
+        let connection = Rc::new(OmpAgentConnection::new(command));
+        let project = Project::example([workspace.path()], &mut cx.to_async()).await;
+
+        // A missing binary must fail (not panic). The error carries a clear,
+        // user-facing OMP status that the agent panel renders via its
+        // "Failed to Launch" surface.
+        let err = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[workspace.path()]), cx)
+            })
+            .await
+            .expect_err("a missing OMP binary must degrade with an error, not a panic");
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("omp.binary_path"),
+            "missing-binary launch error must name the fix, got: {full}"
+        );
     }
 
     #[test]
