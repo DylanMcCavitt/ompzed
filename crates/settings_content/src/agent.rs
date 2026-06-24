@@ -752,6 +752,21 @@ pub struct OmpSettingsContent {
     ///
     /// Default: ".omp"
     pub config_dir: Option<String>,
+
+    /// Whether the OMP agent panel surfaces a user-initiated terminal/task
+    /// runner for this workspace. Off by default. The OMP agent never drives
+    /// the terminal — tasks start only on explicit user action, and agent
+    /// output is never written to a task's input.
+    ///
+    /// Default: false
+    pub terminal_integration: Option<bool>,
+
+    /// Shell command the user-initiated OMP task runner executes when
+    /// `terminal_integration` is enabled. Runs in the workspace root via
+    /// `<shell> -lc <command>`, output-only (no input channel).
+    ///
+    /// Default: null
+    pub terminal_task_command: Option<String>,
 }
 
 #[with_fallible_options]

@@ -136,6 +136,11 @@ pub struct OmpSettings {
     pub binary_path: Option<PathBuf>,
     /// User-configured workspace config directory, if any.
     pub config_dir: Option<PathBuf>,
+    /// Whether the OMP panel surfaces a user-initiated terminal/task runner.
+    /// Off by default; the agent never drives the terminal.
+    pub terminal_integration: bool,
+    /// Shell command the user-initiated task runner executes, if configured.
+    pub terminal_task_command: Option<String>,
 }
 
 impl settings::Settings for OmpSettings {
@@ -144,8 +149,16 @@ impl settings::Settings for OmpSettings {
         Self {
             binary_path: non_empty_path(omp.binary_path),
             config_dir: non_empty_path(omp.config_dir),
+            terminal_integration: omp.terminal_integration.unwrap_or(false),
+            terminal_task_command: non_empty_string(omp.terminal_task_command),
         }
     }
+}
+
+fn non_empty_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|raw| raw.trim().to_owned())
+        .filter(|raw| !raw.is_empty())
 }
 
 fn non_empty_path(value: Option<String>) -> Option<PathBuf> {

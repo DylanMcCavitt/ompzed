@@ -35,6 +35,7 @@ pub mod thread_worktree_archive;
 
 mod github_context;
 mod linear_context;
+mod omp_terminal;
 mod subagent_tree;
 pub mod threads_archive_view;
 mod ui;

@@ -3,6 +3,7 @@ mod custom;
 mod github_context;
 mod linear_context;
 mod omp;
+mod omp_terminal;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;
@@ -24,6 +25,7 @@ pub use linear_context::{
 pub use omp::{
     OMP_AGENT_ID, OmpAgentConnection, OmpAgentServer, OmpDiscovery, OmpSettings, discover_omp,
 };
+pub use omp_terminal::{OmpTask, default_shell, shell_invocation, spawn_workspace_task};
 use project::{AgentId, Project, agent_server_store::AgentServerStore};
 
 use acp_thread::AgentConnection;
