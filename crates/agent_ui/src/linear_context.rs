@@ -120,11 +120,10 @@ impl LinearContextView {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
-                .children(rows.into_iter().map(|row| {
-                    Label::new(row)
-                        .size(LabelSize::Small)
-                        .into_any_element()
-                }))
+                .children(
+                    rows.into_iter()
+                        .map(|row| Label::new(row).size(LabelSize::Small).into_any_element()),
+                )
                 .into_any_element(),
         )
     }

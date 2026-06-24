@@ -29,20 +29,17 @@ impl UiRequestPrompt {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input_editor = matches!(
-            request.kind,
-            UiRequestKind::Input | UiRequestKind::Editor
-        )
-        .then(|| {
-            let default_value = request.default_value.clone();
-            cx.new(|cx| {
-                let mut editor = Editor::single_line(window, cx);
-                if let Some(default_value) = default_value {
-                    editor.set_text(default_value, window, cx);
-                }
-                editor
-            })
-        });
+        let input_editor = matches!(request.kind, UiRequestKind::Input | UiRequestKind::Editor)
+            .then(|| {
+                let default_value = request.default_value.clone();
+                cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    if let Some(default_value) = default_value {
+                        editor.set_text(default_value, window, cx);
+                    }
+                    editor
+                })
+            });
         Self {
             thread,
             request,
@@ -189,9 +186,9 @@ impl UiRequestPrompt {
                         let option_id = option.id.clone();
                         let element_id =
                             SharedString::from(format!("ui-request-option-{}", option.id));
-                        Button::new(element_id, option.label).on_click(cx.listener(
-                            move |this, _, _, cx| this.select(option_id.clone(), cx),
-                        ))
+                        Button::new(element_id, option.label).on_click(
+                            cx.listener(move |this, _, _, cx| this.select(option_id.clone(), cx)),
+                        )
                     }))
                     .child(deny)
                     .into_any_element()
@@ -241,9 +238,7 @@ impl Render for UiRequestPrompt {
                     .size(LabelSize::Small)
                     .color(Color::Accent),
             )
-            .when(!message.is_empty(), |this| {
-                this.child(Label::new(message))
-            })
+            .when(!message.is_empty(), |this| this.child(Label::new(message)))
             .children(Self::render_scope(&self.request.scope))
             .child(self.render_controls(cx))
     }
@@ -305,9 +300,8 @@ mod tests {
     #[gpui::test]
     async fn deny_control_holds_focus_by_default(cx: &mut TestAppContext) {
         let (_connection, thread, request) = setup(UiRequestKind::Approval, Vec::new(), cx).await;
-        let (prompt, cx) = cx.add_window_view(|window, cx| {
-            UiRequestPrompt::new(thread, request, window, cx)
-        });
+        let (prompt, cx) =
+            cx.add_window_view(|window, cx| UiRequestPrompt::new(thread, request, window, cx));
         cx.run_until_parked();
         let deny = prompt.read_with(cx, |prompt, _| prompt.deny_focus_handle.clone());
         let focused = cx.update(|window, _| deny.is_focused(window));
@@ -320,9 +314,8 @@ mod tests {
         cx.update(|cx| {
             cx.bind_keys([gpui::KeyBinding::new("escape", menu::Cancel, None)]);
         });
-        let (_prompt, cx) = cx.add_window_view(|window, cx| {
-            UiRequestPrompt::new(thread, request, window, cx)
-        });
+        let (_prompt, cx) =
+            cx.add_window_view(|window, cx| UiRequestPrompt::new(thread, request, window, cx));
         cx.run_until_parked();
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
@@ -335,9 +328,8 @@ mod tests {
     #[gpui::test]
     async fn approve_sends_approve_exactly_once(cx: &mut TestAppContext) {
         let (connection, thread, request) = setup(UiRequestKind::Approval, Vec::new(), cx).await;
-        let (prompt, cx) = cx.add_window_view(|window, cx| {
-            UiRequestPrompt::new(thread, request, window, cx)
-        });
+        let (prompt, cx) =
+            cx.add_window_view(|window, cx| UiRequestPrompt::new(thread, request, window, cx));
         prompt.update_in(cx, |prompt, window, cx| prompt.approve(window, cx));
         // A second interaction must be ignored (answer-once at the widget too).
         prompt.update_in(cx, |prompt, window, cx| prompt.deny(window, cx));
@@ -361,9 +353,8 @@ mod tests {
             },
         ];
         let (connection, thread, request) = setup(UiRequestKind::Select, options, cx).await;
-        let (prompt, cx) = cx.add_window_view(|window, cx| {
-            UiRequestPrompt::new(thread, request, window, cx)
-        });
+        let (prompt, cx) =
+            cx.add_window_view(|window, cx| UiRequestPrompt::new(thread, request, window, cx));
         prompt.update(cx, |prompt, cx| prompt.select("b".into(), cx));
         cx.run_until_parked();
         assert_eq!(
@@ -375,9 +366,8 @@ mod tests {
     #[gpui::test]
     async fn open_url_requires_explicit_action(cx: &mut TestAppContext) {
         let (connection, thread, request) = setup(UiRequestKind::OpenUrl, Vec::new(), cx).await;
-        let (prompt, cx) = cx.add_window_view(|window, cx| {
-            UiRequestPrompt::new(thread, request, window, cx)
-        });
+        let (prompt, cx) =
+            cx.add_window_view(|window, cx| UiRequestPrompt::new(thread, request, window, cx));
         cx.run_until_parked();
         // Nothing is sent until the user acts: no auto-navigation, no response.
         assert!(connection.ui_responses().is_empty());

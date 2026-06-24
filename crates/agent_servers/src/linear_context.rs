@@ -385,9 +385,12 @@ mod tests {
     async fn fetch_maps_data_and_sets_auth_header(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
         let (http, captured) = client(200, OK_BODY);
-        let context =
-            fetch_linear_context(http, Arc::from("lin_api_secret"), LINEAR_CONTEXT_DEFAULT_LIMIT)
-                .await;
+        let context = fetch_linear_context(
+            http,
+            Arc::from("lin_api_secret"),
+            LINEAR_CONTEXT_DEFAULT_LIMIT,
+        )
+        .await;
 
         assert!(context.authenticated);
         assert_eq!(context.viewer.as_deref(), Some("Ada Lovelace"));

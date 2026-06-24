@@ -274,7 +274,11 @@ fn register_language_model_providers(
     // provider code is retained for collaboration and that opt-in path.
     if std::env::var_os("OMPZED_ENABLE_ZED_CLOUD").is_some() {
         registry.register_provider(
-            Arc::new(CloudLanguageModelProvider::new(user_store, client.clone(), cx)),
+            Arc::new(CloudLanguageModelProvider::new(
+                user_store,
+                client.clone(),
+                cx,
+            )),
             cx,
         );
     }

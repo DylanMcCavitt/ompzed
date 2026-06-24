@@ -146,7 +146,11 @@ impl GithubContextView {
             .w_full()
             .gap_1()
             .child(toggle)
-            .child(Icon::new(IconName::Github).size(IconSize::Small).color(text_color))
+            .child(
+                Icon::new(IconName::Github)
+                    .size(IconSize::Small)
+                    .color(text_color),
+            )
             .child(
                 Label::new(context.summary_label())
                     .size(LabelSize::Small)

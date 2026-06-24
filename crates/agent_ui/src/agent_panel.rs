@@ -1,13 +1,4 @@
-use std::{
-    cell::Cell,
-    fmt,
-    path::PathBuf,
-    rc::Rc,
-    sync::{
-        Arc,
-    },
-    time::Duration,
-};
+use std::{cell::Cell, fmt, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
@@ -25,8 +16,8 @@ use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
         AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResolveConflictedFilesWithAgent,
-        ResolveConflictsWithAgent, ReviewBranchDiff,
+        ResetAgentZoom, ResolveConflictedFilesWithAgent, ResolveConflictsWithAgent,
+        ReviewBranchDiff,
     },
     assistant::{
         FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
@@ -46,8 +37,8 @@ use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadata
 use crate::{
     AddContextServer, AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow,
     LoadThreadFromClipboard, NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown,
-    OpenAgentDiff, ResetFastModeWarnings,
-    ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
+    OpenAgentDiff, ResetFastModeWarnings, ShowAllSidebarThreadMetadata, ShowThreadMetadata,
+    ToggleNewThreadMenu, ToggleOptionsMenu,
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
@@ -1469,7 +1460,6 @@ impl AgentPanel {
         let thread_store = ThreadStore::global(cx);
 
         let base_view = BaseView::Uninitialized;
-
 
         // Subscribe to extension events to sync agent servers when extensions change
         let extension_subscription = ExtensionStore::try_global(cx).map(|store| {
@@ -5919,38 +5909,44 @@ impl AgentPanel {
                                 this
                             }
                         })
-                        .when(AgentPanel::native_agent_offered_in_picker(is_via_collab), |menu| menu
-                        .item(
-                            ContextMenuEntry::new("Built-in Agent")
-                                .when(
-                                    !showing_terminal && is_agent_selected(Agent::NativeAgent),
-                                    |this| this.action(Box::new(NewThread)),
-                                )
-                                .icon(IconName::ZedAgent)
-                                .icon_color(Color::Muted)
-                                .handler({
-                                    let workspace = workspace.clone();
-                                    move |window, cx| {
-                                        if let Some(workspace) = workspace.upgrade() {
-                                            workspace.update(cx, |workspace, cx| {
-                                                if let Some(panel) =
-                                                    workspace.panel::<AgentPanel>(cx)
-                                                {
-                                                    panel.update(cx, |panel, cx| {
-                                                        panel.selected_agent = Agent::NativeAgent;
-                                                        panel.activate_new_thread(
-                                                            true,
-                                                            AgentThreadSource::AgentPanel,
-                                                            window,
-                                                            cx,
-                                                        );
+                        .when(
+                            AgentPanel::native_agent_offered_in_picker(is_via_collab),
+                            |menu| {
+                                menu.item(
+                                    ContextMenuEntry::new("Built-in Agent")
+                                        .when(
+                                            !showing_terminal
+                                                && is_agent_selected(Agent::NativeAgent),
+                                            |this| this.action(Box::new(NewThread)),
+                                        )
+                                        .icon(IconName::ZedAgent)
+                                        .icon_color(Color::Muted)
+                                        .handler({
+                                            let workspace = workspace.clone();
+                                            move |window, cx| {
+                                                if let Some(workspace) = workspace.upgrade() {
+                                                    workspace.update(cx, |workspace, cx| {
+                                                        if let Some(panel) =
+                                                            workspace.panel::<AgentPanel>(cx)
+                                                        {
+                                                            panel.update(cx, |panel, cx| {
+                                                                panel.selected_agent =
+                                                                    Agent::NativeAgent;
+                                                                panel.activate_new_thread(
+                                                                    true,
+                                                                    AgentThreadSource::AgentPanel,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }
                                                     });
                                                 }
-                                            });
-                                        }
-                                    }
-                                }),
-                        ))
+                                            }
+                                        }),
+                                )
+                            },
+                        )
                         .item(
                             ContextMenuEntry::new("Ompzed Agent")
                                 .when(!showing_terminal && is_agent_selected(Agent::Omp), |this| {

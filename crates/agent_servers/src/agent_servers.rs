@@ -12,11 +12,11 @@ use client::ProxySettings;
 use collections::{HashMap, HashSet};
 pub use custom::*;
 use fs::Fs;
-use http_client::read_no_proxy_from_env;
 pub use github_context::{
     DEFAULT_LIMIT as GITHUB_CONTEXT_DEFAULT_LIMIT, GithubContext, GithubRef, GithubRepo,
     fetch_github_context,
 };
+use http_client::read_no_proxy_from_env;
 pub use linear_context::{
     LINEAR_CONTEXT_DEFAULT_LIMIT, LinearContext, LinearIssue, LinearTeam, build_linear_query,
     clear_linear_api_key, connect_linear_from_env, fetch_linear_context, load_linear_context,
