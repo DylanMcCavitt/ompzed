@@ -192,7 +192,14 @@ pub async fn fetch_github_context(
         &gh,
         &work_dir,
         &[
-            "issue", "list", "--state", "open", "--limit", &limit, "--json", "number,title",
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            &limit,
+            "--json",
+            "number,title",
         ],
     )
     .await
@@ -203,7 +210,14 @@ pub async fn fetch_github_context(
         &gh,
         &work_dir,
         &[
-            "pr", "list", "--state", "open", "--limit", &limit, "--json", "number,title",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            &limit,
+            "--json",
+            "number,title",
         ],
     )
     .await
