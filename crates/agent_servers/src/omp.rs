@@ -11,6 +11,7 @@ use futures::{
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task};
 use project::{AgentId, Project};
 use serde_json::{Value, json};
+use settings::Settings as _;
 use std::{
     any::Any,
     cell::{Cell, RefCell},
@@ -42,7 +43,7 @@ impl AgentServer for OmpAgentServer {
         _project: Entity<Project>,
         cx: &mut App,
     ) -> Task<Result<Rc<dyn AgentConnection>>> {
-        let command = OmpCommand::default();
+        let command = OmpCommand::from_settings(cx);
         cx.spawn(async move |cx| {
             let connection = Rc::new(OmpAgentConnection::new(command));
             cx.update(|cx| connection.register_app_quit(cx));
@@ -66,6 +67,24 @@ impl Default for OmpCommand {
         Self {
             program: resolve_omp_binary(),
             prefix_args: Vec::new(),
+        }
+    }
+}
+
+impl OmpCommand {
+    /// Builds the launch command for a new session, honoring a user-configured
+    /// `omp` binary path when one is set and points at an existing file.
+    /// Otherwise resolves the binary the usual way.
+    fn from_settings(cx: &App) -> Self {
+        let configured = OmpSettings::try_get(cx)
+            .and_then(|settings| settings.binary_path.clone())
+            .filter(|path| path.exists());
+        match configured {
+            Some(program) => Self {
+                program,
+                prefix_args: Vec::new(),
+            },
+            None => Self::default(),
         }
     }
 }
@@ -101,6 +120,144 @@ fn augmented_path() -> Option<std::ffi::OsString> {
         }
     }
     std::env::join_paths(paths).ok()
+}
+
+/// Workspace-scoped defaults for the built-in OMP agent. Registered with the
+/// settings store, so values layer exactly like every other Zed setting: a
+/// global default in the user settings, optionally overridden per-workspace in
+/// a worktree's `.zed/settings.json`. These survive settings reloads because
+/// they are re-derived from the merged settings content on every recompute.
+#[derive(Clone, Debug, Default, PartialEq, Eq, settings::RegisterSetting)]
+pub struct OmpSettings {
+    /// User-configured path to the `omp` binary, if any.
+    pub binary_path: Option<PathBuf>,
+    /// User-configured workspace config directory, if any.
+    pub config_dir: Option<PathBuf>,
+}
+
+impl settings::Settings for OmpSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let omp = content.omp.clone().unwrap_or_default();
+        Self {
+            binary_path: non_empty_path(omp.binary_path),
+            config_dir: non_empty_path(omp.config_dir),
+        }
+    }
+}
+
+fn non_empty_path(value: Option<String>) -> Option<PathBuf> {
+    value
+        .map(|raw| raw.trim().to_owned())
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Default workspace-scoped OMP config directory, relative to the workspace
+/// root, when the user has not configured one.
+const DEFAULT_WORKSPACE_CONFIG_DIR: &str = ".omp";
+
+/// Result of probing a workspace for OMP availability. Every field degrades
+/// gracefully when something is missing — nothing here spawns a child, blocks,
+/// or panics — so a missing binary or config surfaces as a visible status
+/// rather than a silent failure.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OmpDiscovery {
+    /// Resolved `omp` binary, when one was found.
+    pub binary: Option<PathBuf>,
+    /// Workspace config directory, when it exists.
+    pub config_dir: Option<PathBuf>,
+    /// Number of workspace command files found under `<config>/commands`.
+    pub command_count: usize,
+}
+
+impl OmpDiscovery {
+    pub fn binary_available(&self) -> bool {
+        self.binary.is_some()
+    }
+
+    pub fn config_available(&self) -> bool {
+        self.config_dir.is_some()
+    }
+
+    /// A short, user-facing status line. Always non-empty: a missing binary or
+    /// config is reported as a visible message instead of nothing.
+    pub fn status_label(&self) -> SharedString {
+        if self.binary.is_none() {
+            return "OMP binary not found — install omp or set its path in settings".into();
+        }
+        match (&self.config_dir, self.command_count) {
+            (None, _) => "OMP ready · no workspace config".into(),
+            (Some(_), 0) => "OMP ready · workspace config found".into(),
+            (Some(_), 1) => "OMP ready · 1 workspace command".into(),
+            (Some(_), count) => format!("OMP ready · {count} workspace commands").into(),
+        }
+    }
+}
+
+/// Probe a workspace for OMP availability without spawning anything.
+///
+/// `binary_override` and `config_override` come from [`OmpSettings`]; when
+/// unset, the binary is resolved the same way the launcher resolves it and the
+/// config directory defaults to `.omp` under `work_dir`. Missing pieces degrade
+/// to `None`/`0`.
+pub fn discover_omp(
+    binary_override: Option<&Path>,
+    config_override: Option<&Path>,
+    work_dir: &Path,
+) -> OmpDiscovery {
+    let binary = resolve_discovery_binary(binary_override);
+    let config_dir = resolve_config_dir(config_override, work_dir).filter(|dir| dir.is_dir());
+    let command_count = config_dir
+        .as_deref()
+        .map(count_workspace_commands)
+        .unwrap_or(0);
+    OmpDiscovery {
+        binary,
+        config_dir,
+        command_count,
+    }
+}
+
+fn resolve_discovery_binary(binary_override: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = binary_override
+        && path.exists()
+    {
+        return Some(path.to_path_buf());
+    }
+    resolve_omp_binary_path()
+}
+
+/// Resolve the `omp` binary, returning `None` when no real binary exists — as
+/// opposed to [`resolve_omp_binary`], which falls back to the bare name `omp`.
+fn resolve_omp_binary_path() -> Option<PathBuf> {
+    if let Some(binary) = std::env::var_os("OMP_BINARY") {
+        let path = PathBuf::from(binary);
+        return path.exists().then_some(path);
+    }
+    common_tool_dirs()
+        .into_iter()
+        .map(|dir| dir.join("omp"))
+        .find(|candidate| candidate.exists())
+}
+
+fn resolve_config_dir(config_override: Option<&Path>, work_dir: &Path) -> Option<PathBuf> {
+    let dir = match config_override {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => work_dir.join(path),
+        None => work_dir.join(DEFAULT_WORKSPACE_CONFIG_DIR),
+    };
+    Some(dir)
+}
+
+fn count_workspace_commands(config_dir: &Path) -> usize {
+    let commands_dir = config_dir.join("commands");
+    let Ok(entries) = std::fs::read_dir(&commands_dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .count()
 }
 
 struct PendingPrompt {
@@ -375,7 +532,18 @@ impl OmpSessionState {
             cmd.env("PATH", path);
         }
 
-        let mut child = Child::spawn(cmd, Stdio::piped(), Stdio::piped(), Stdio::piped())?;
+        // Surface a clear, user-facing status when the agent can't start (most
+        // often a missing binary). This error propagates up through
+        // `new_session` and is rendered by the agent panel's "Failed to Launch"
+        // surface, so a missing OMP degrades visibly instead of with a cryptic
+        // OS error.
+        let mut child = Child::spawn(cmd, Stdio::piped(), Stdio::piped(), Stdio::piped())
+            .with_context(|| {
+                format!(
+                    "Could not start the OMP agent ({}). Install omp or set `omp.binary_path` in settings.",
+                    command.program.display()
+                )
+            })?;
         let stdin = child.stdin.take().context("failed to take OMP stdin")?;
         let stdout = child.stdout.take().context("failed to take OMP stdout")?;
         let stderr = child.stderr.take().context("failed to take OMP stderr")?;
@@ -1411,6 +1579,38 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn omp_new_session_passes_selected_workspace_cwd_to_omp(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmp::new("normal");
+        // A throwaway "selected workspace" directory, distinct from the fixture
+        // directory that holds the fake omp script.
+        let workspace = tempfile::tempdir().unwrap();
+        let connection = Rc::new(OmpAgentConnection::new(fixture.command()));
+        let project = Project::example([workspace.path()], &mut cx.to_async()).await;
+        let _thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[workspace.path()]), cx)
+            })
+            .await
+            .unwrap();
+
+        // The launched child must be told the selected workspace via `--cwd`
+        // and must actually run in that directory.
+        let args = fixture.args();
+        assert!(
+            args.contains("--cwd"),
+            "fake omp argv should carry a --cwd flag, got: {args}"
+        );
+        assert_eq!(
+            fs::canonicalize(fixture.cwd()).unwrap(),
+            fs::canonicalize(workspace.path()).unwrap(),
+            "fake omp should be launched in the selected workspace cwd"
+        );
+    }
+
+    #[gpui::test]
     async fn omp_two_saved_sessions_switch_and_close_independently(cx: &mut TestAppContext) {
         crate::e2e_tests::init_test(cx).await;
         let fixture = FakeResumableOmp::new();
@@ -1532,11 +1732,236 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn omp_new_sessions_bind_each_selected_workspace_cwd(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let fixture = FakeOmp::new("normal");
+        let connection = Rc::new(OmpAgentConnection::new(fixture.command()));
+
+        // Two distinct selected workspaces. Each new session is launched in its
+        // own cwd; a live child's cwd is fixed at spawn, so opening a session in
+        // a different workspace never moves an earlier one.
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+
+        let project_a = Project::example([workspace_a.path()], &mut cx.to_async()).await;
+        let _thread_a = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project_a, PathList::new(&[workspace_a.path()]), cx)
+            })
+            .await
+            .unwrap();
+
+        let project_b = Project::example([workspace_b.path()], &mut cx.to_async()).await;
+        let _thread_b = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project_b, PathList::new(&[workspace_b.path()]), cx)
+            })
+            .await
+            .unwrap();
+
+        // Each child recorded a launch marker inside the workspace it ran in.
+        let marker_a = read_launch_marker(workspace_a.path());
+        let marker_b = read_launch_marker(workspace_b.path());
+        assert_eq!(
+            fs::canonicalize(&marker_a).unwrap(),
+            fs::canonicalize(workspace_a.path()).unwrap()
+        );
+        assert_eq!(
+            fs::canonicalize(&marker_b).unwrap(),
+            fs::canonicalize(workspace_b.path()).unwrap()
+        );
+        // The second session in workspace B did not disturb workspace A's cwd.
+        assert_ne!(marker_a, marker_b);
+    }
+
+    #[gpui::test]
+    async fn omp_missing_binary_yields_visible_launch_error(cx: &mut TestAppContext) {
+        crate::e2e_tests::init_test(cx).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let missing = workspace.path().join("definitely-not-omp");
+        let command = OmpCommand {
+            program: missing,
+            prefix_args: Vec::new(),
+        };
+        let connection = Rc::new(OmpAgentConnection::new(command));
+        let project = Project::example([workspace.path()], &mut cx.to_async()).await;
+
+        // A missing binary must fail (not panic). The error carries a clear,
+        // user-facing OMP status that the agent panel renders via its
+        // "Failed to Launch" surface.
+        let err = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[workspace.path()]), cx)
+            })
+            .await
+            .expect_err("a missing OMP binary must degrade with an error, not a panic");
+        let full = format!("{err:#}");
+        assert!(
+            full.contains("omp.binary_path"),
+            "missing-binary launch error must name the fix, got: {full}"
+        );
+    }
+
+    #[test]
+    fn omp_discovery_status_is_visible_when_binary_missing() {
+        // Construct the missing-binary state directly so this does not depend on
+        // whether a real omp happens to be installed on the host.
+        let discovery = OmpDiscovery::default();
+        assert!(!discovery.binary_available());
+        assert!(!discovery.config_available());
+        let label = discovery.status_label();
+        assert!(!label.is_empty(), "status must be a visible message");
+        assert!(
+            label.contains("not found"),
+            "a missing binary must surface a visible status, got: {label}"
+        );
+    }
+
+    #[test]
+    fn omp_discovery_probes_empty_workspace_without_crashing() {
+        // Probing a workspace with no `.omp` config must degrade gracefully: no
+        // panic, no config, zero commands, and a non-empty status. The binary
+        // may or may not be present on the host, so it is not asserted here.
+        let workspace = tempfile::tempdir().unwrap();
+        let missing_binary = workspace.path().join("nonexistent-omp");
+        let discovery = discover_omp(Some(&missing_binary), None, workspace.path());
+        assert!(!discovery.config_available());
+        assert_eq!(discovery.command_count, 0);
+        assert!(!discovery.status_label().is_empty());
+    }
+
+    #[test]
+    fn omp_discovery_finds_binary_and_workspace_config() {
+        let workspace = tempfile::tempdir().unwrap();
+        // A real (existing) fake binary file.
+        let binary = workspace.path().join("omp");
+        fs::write(&binary, "#!/bin/sh\n").unwrap();
+        // Workspace config with two command files.
+        let commands = workspace.path().join(".omp").join("commands");
+        fs::create_dir_all(&commands).unwrap();
+        fs::write(commands.join("build.md"), "build").unwrap();
+        fs::write(commands.join("test.md"), "test").unwrap();
+
+        let discovery = discover_omp(Some(&binary), None, workspace.path());
+        assert!(discovery.binary_available());
+        assert!(discovery.config_available());
+        assert_eq!(discovery.command_count, 2);
+        let label = discovery.status_label();
+        assert!(label.contains("ready"), "got: {label}");
+        assert!(label.contains("2 workspace commands"), "got: {label}");
+    }
+
+    #[test]
+    fn omp_discovery_honors_relative_config_override() {
+        let workspace = tempfile::tempdir().unwrap();
+        let binary = workspace.path().join("omp");
+        fs::write(&binary, "#!/bin/sh\n").unwrap();
+        let custom = workspace.path().join("tools").join("omp-config");
+        fs::create_dir_all(custom.join("commands")).unwrap();
+        fs::write(custom.join("commands").join("ship.md"), "ship").unwrap();
+
+        let discovery = discover_omp(
+            Some(&binary),
+            Some(Path::new("tools/omp-config")),
+            workspace.path(),
+        );
+        assert!(discovery.config_available());
+        assert_eq!(discovery.command_count, 1);
+    }
+
+    #[gpui::test]
+    fn omp_settings_reload_preserves_workspace_defaults(cx: &mut gpui::App) {
+        use gpui::UpdateGlobal;
+        use settings::{Settings, SettingsStore};
+
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        OmpSettings::register(cx);
+
+        let omp_json =
+            r#"{ "omp": { "binary_path": "/opt/omp/bin/omp", "config_dir": "workspace-omp" } }"#;
+        SettingsStore::update_global(cx, |store, cx| {
+            store.set_user_settings(omp_json, cx).unwrap();
+        });
+
+        // Workspace OMP defaults resolve both globally and through a worktree
+        // location (the same lookup the agent panel uses for the selected
+        // workspace).
+        let location = settings::SettingsLocation {
+            worktree_id: settings::WorktreeId::from_usize(1),
+            path: util::rel_path::RelPath::empty(),
+        };
+        let before = OmpSettings::get_global(cx).clone();
+        assert_eq!(before.binary_path, Some(PathBuf::from("/opt/omp/bin/omp")));
+        assert_eq!(before.config_dir, Some(PathBuf::from("workspace-omp")));
+        assert_eq!(
+            OmpSettings::get(Some(location), cx).binary_path,
+            before.binary_path,
+            "workspace-scoped lookup must resolve the OMP defaults"
+        );
+
+        // A reload re-applies the settings content (as when the settings file is
+        // re-read). The OMP defaults must survive intact.
+        SettingsStore::update_global(cx, |store, cx| {
+            store.set_user_settings(omp_json, cx).unwrap();
+        });
+        let after_reload = OmpSettings::get_global(cx).clone();
+        assert_eq!(after_reload.binary_path, before.binary_path);
+        assert_eq!(after_reload.config_dir, before.config_dir);
+
+        // A reload that changes an UNRELATED setting must not reset the OMP
+        // defaults that remain present.
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{ "omp": { "binary_path": "/opt/omp/bin/omp", "config_dir": "workspace-omp" }, "auto_update": false }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+        let after_unrelated = OmpSettings::get(Some(location), cx);
+        assert_eq!(
+            after_unrelated.binary_path, before.binary_path,
+            "workspace OMP binary default must be preserved across a settings reload"
+        );
+        assert_eq!(
+            after_unrelated.config_dir, before.config_dir,
+            "workspace OMP config default must be preserved across a settings reload"
+        );
+    }
+
+    fn read_launch_marker(workspace: &Path) -> PathBuf {
+        let marker = workspace.join(".omp-cwd");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(value) = fs::read_to_string(&marker)
+                && !value.is_empty()
+            {
+                return PathBuf::from(value);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake OMP did not write a launch marker in {}",
+                workspace.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     struct FakeOmp {
         dir: tempfile::TempDir,
         script_path: PathBuf,
         pid_path: PathBuf,
         ui_response_path: PathBuf,
+        cwd_path: PathBuf,
+        args_path: PathBuf,
     }
 
     impl FakeOmp {
@@ -1545,11 +1970,17 @@ mod tests {
             let script_path = dir.path().join("fake-omp.sh");
             let pid_path = dir.path().join("pid");
             let ui_response_path = dir.path().join("ui-response");
+            let cwd_path = dir.path().join("cwd");
+            let args_path = dir.path().join("args");
             fs::write(
                 &script_path,
                 formatdoc! {r#"
                     #!/bin/sh
                     printf '%s' "$$" > "{pid_path}"
+                    cwd=$(pwd -P)
+                    printf '%s' "$cwd" > "{cwd_path}"
+                    printf '%s' "$*" > "{args_path}"
+                    printf '%s' "$cwd" > "$cwd/.omp-cwd"
                     while IFS= read -r line; do
                       case "$line" in
                         *'"type":"get_state"'*)
@@ -1621,6 +2052,8 @@ mod tests {
                 "#,
                     pid_path = pid_path.display(),
                     ui_response_path = ui_response_path.display(),
+                    cwd_path = cwd_path.display(),
+                    args_path = args_path.display(),
                     mode = mode,
                 },
             )
@@ -1633,6 +2066,35 @@ mod tests {
                 script_path,
                 pid_path,
                 ui_response_path,
+                cwd_path,
+                args_path,
+            }
+        }
+
+        /// Working directory the fake OMP child was launched in. Blocks briefly
+        /// for the child to record it at startup.
+        fn cwd(&self) -> PathBuf {
+            PathBuf::from(self.read_startup(&self.cwd_path, "cwd"))
+        }
+
+        /// Space-joined argv the fake OMP child was launched with.
+        fn args(&self) -> String {
+            self.read_startup(&self.args_path, "args")
+        }
+
+        fn read_startup(&self, path: &Path, label: &str) -> String {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(value) = fs::read_to_string(path)
+                    && !value.is_empty()
+                {
+                    return value;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fake OMP did not record {label}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
 

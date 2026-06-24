@@ -731,6 +731,29 @@ pub enum CustomAgentServerSettings {
     },
 }
 
+/// Workspace-scoped configuration for the built-in OMP (Oh My Pi) agent.
+///
+/// These are OMP-specific defaults and intentionally do not duplicate Zed's
+/// editor/project settings. Because this lives in the unified settings tree it
+/// participates in Zed's normal layering, so values can be set globally in the
+/// user settings or per-workspace in a worktree's `.zed/settings.json`.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct OmpSettingsContent {
+    /// Absolute path to the `omp` binary. When unset, Zed resolves it from the
+    /// `OMP_BINARY` environment variable, the `PATH`, and common tool
+    /// directories.
+    ///
+    /// Default: null
+    pub binary_path: Option<String>,
+
+    /// Directory holding workspace-scoped OMP config and commands. Relative
+    /// paths resolve against the workspace root.
+    ///
+    /// Default: ".omp"
+    pub config_dir: Option<String>,
+}
+
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct SandboxPermissionsContent {
