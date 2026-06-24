@@ -2833,6 +2833,14 @@ impl AgentPanel {
         self.project.read(cx).visible_worktrees(cx).next().is_some()
     }
 
+    /// Whether the native Zed agent is offered in the new-thread agent picker.
+    /// OMP is the primary agent, so the native agent is only offered in
+    /// collaboration sessions (which hard-require it); normal sessions never
+    /// list it. The native agent code path is retained for collab (AGE-677).
+    fn native_agent_offered_in_picker(is_via_collab: bool) -> bool {
+        is_via_collab
+    }
+
     fn ensure_native_agent_connection(&self, cx: &mut Context<Self>) {
         if !self.has_open_project(cx) {
             return;
@@ -5955,6 +5963,7 @@ impl AgentPanel {
                                 this
                             }
                         })
+                        .when(AgentPanel::native_agent_offered_in_picker(is_via_collab), |menu| menu
                         .item(
                             ContextMenuEntry::new("Built-in Agent")
                                 .when(
@@ -5985,7 +5994,7 @@ impl AgentPanel {
                                         }
                                     }
                                 }),
-                        )
+                        ))
                         .item(
                             ContextMenuEntry::new("Ompzed Agent")
                                 .when(!showing_terminal && is_agent_selected(Agent::Omp), |this| {
@@ -11319,6 +11328,14 @@ mod tests {
             .unwrap(),
             r#"{"custom":{"name":"my-agent"}}"#,
         );
+    }
+
+    #[test]
+    fn native_agent_only_offered_in_collab() {
+        // OMP is primary: the native agent is hidden from the picker in a
+        // normal session and only offered in collaboration (which requires it).
+        assert!(!AgentPanel::native_agent_offered_in_picker(false));
+        assert!(AgentPanel::native_agent_offered_in_picker(true));
     }
 
     #[gpui::test]
